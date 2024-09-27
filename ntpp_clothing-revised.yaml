@@ -1,0 +1,78 @@
+name: mayank-mm-clothing
+compute:
+  cluster: r14z3p1
+  gpu_type: h100_80gb
+  gpus: 8
+image: mosaicml/composer:latest # Use the MosaicML image that has Composer pre-installed
+integrations:
+  - integration_type: pip_packages
+    packages:
+      - scikit-learn
+      - numpy==1.23
+      - mosaicml==0.17.2
+      - onnx
+      - onnxruntime-gpu
+      - onnxruntime
+      - dask
+      - datasets
+      - flash-attn==1.0.4
+    upgrade: true
+  - integration_type: git_repo
+    git_repo: nlpravi/mosaic_finetuning
+    git_branch: ayush
+    path: /workspace # The folder to clone the code into
+command: PYTHONUNBUFFERED=1 composer /workspace/finetune_single_feature.py -f /mnt/config/parameters.yaml --master_port 4040
+parameters:
+  job_name: mm-clothing-mayank
+  workdir: /workspace/data
+#  pretrained: s3://mosaicml-68c98fa5-0b21-4c7b-b40b-c4482db8832a/pretrained_lms/av2-bert-base-uncased/
+#  pretrained: s3://mosaicml-68c98fa5-0b21-4c7b-b40b-c4482db8832a/pretrained_lms/C4_v2/
+  # if true
+  # this parameter decides if the pytorch_model.bin located under pretrained
+  # needs to be loaded via the composer.load_state_dict
+  # if false, then the pytorch_model.bin will be loaded via transformers.AutoModelForSequenceClassification.from_config
+  load_as_weights: false
+  maxlen: 256
+  # maxlen: 32
+  model: distilbert-base-uncased
+  #dataset: s3://mosaicml-68c98fa5-0b21-4c7b-b40b-c4482db8832a/datasets/taxcode/2023-01/specific_codes/clothing
+  #s3_out_dest: s3://mosaicml-68c98fa5-0b21-4c7b-b40b-c4482db8832a/models/taxcode/2023-01/specific_codes/feb23-tpp-removed/clothing
+  #dataset: s3://mosaicml-68c98fa5-0b21-4c7b-b40b-c4482db8832a/datasets/taxcode/2022-07/clothing
+  #s3_out_dest: s3://mosaicml-68c98fa5-0b21-4c7b-b40b-c4482db8832a/models/taxcode/2023-01/baseline/feb23-tpp-removed/clothing
+  # dataset used to train the prod modeels as of feb 2023
+  dataset: s3://avalara-mosaicml-datasets/taxcode/mayank/clothing_data_mm/
+  s3_out_dest: s3://avalara-mosaicml-datasets/taxcode/mayank/clothing_model_mm/
+  max_duration: 5ep
+  train_subset_num_batches: -1
+  precision: amp_fp16
+  save_interval: 1ep
+  log_to_console: false
+  progress_bar: false
+  console_log_level: batch
+  log_every_x_batches: 5000
+  train_batch_size: 128
+  eval_batch_size: 5000
+  grad_accum: 1
+  save_onnx: true
+  save_composer_checkpoint: true
+  copy_lm: false
+  comments: |
+    distilbert seq 256 5ep
+  optimizer:
+    adam:
+      lr: 5e-5
+      betas:
+        - 0.9
+        - 0.999
+      eps: 1e-8
+#      weight_decay: 5.0e-6
+      weight_decay: 0
+  scheduler:
+    linear_scheduler:
+      alpha_i: 1.0
+      alpha_f: 0.0
+      t_max: 1dur
+  algorithms: []
+#    - FusedLayerNorm
+#    - GatedLinearUnits
+
