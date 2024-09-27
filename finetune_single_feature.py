@@ -31,7 +31,7 @@ from composer import Callback, Event, Logger, State
 from datasets.utils import disable_progress_bar
 import time
 import datetime
-from pysrc.inference_export import export_for_inference
+# from pysrc.inference_export import export_for_inference
 import pandas as pd
 
 
@@ -216,7 +216,7 @@ if __name__ == "__main__":
     if train_config["dataset"] is None:
         raise Exception("dataset path mandatory")
 
-    save_onnx = str(train_config.get("save_onnx","true")).strip().lower() in ["true"]
+    # save_onnx = str(train_config.get("save_onnx","true")).strip().lower() in ["true"]
 
     # region prepare_disk
     w = train_config["workdir"].rstrip("/")
@@ -577,37 +577,37 @@ if __name__ == "__main__":
 
 
     #region export for inference using ONNX
-    if save_onnx:
-        with dist.run_local_rank_zero_first():
-            if dist.get_global_rank() == 0:
-                onnx_model_save_path = os.path.join(final_model_dir, 'model2.onnx')
+    # if save_onnx:
+    #     with dist.run_local_rank_zero_first():
+    #         if dist.get_global_rank() == 0:
+    #             onnx_model_save_path = os.path.join(final_model_dir, 'model2.onnx')
 
-                # print(trainer.state.batch)
-                print(trainer.state.batch.keys())
-                sample_input = trainer.state.batch
-                # the keys when we tokenize will be
-                # input_ids, attention_mask
-                # remove all other keys
-                if 'labels' in sample_input:
-                    del sample_input['labels']
+    #             # print(trainer.state.batch)
+    #             print(trainer.state.batch.keys())
+    #             sample_input = trainer.state.batch
+    #             # the keys when we tokenize will be
+    #             # input_ids, attention_mask
+    #             # remove all other keys
+    #             if 'labels' in sample_input:
+    #                 del sample_input['labels']
 
-                # ONNX export requires all values to be moved to the CPU
-                device = torch.device('cpu')
-                composer_model.to(device=device)
-                for key, value in sample_input.items():
-                    sample_input[key] = value.to(device=device)
+    #             # ONNX export requires all values to be moved to the CPU
+    #             device = torch.device('cpu')
+    #             composer_model.to(device=device)
+    #             for key, value in sample_input.items():
+    #                 sample_input[key] = value.to(device=device)
 
-                export_for_inference(
-                    model=composer_model,
-                    save_format="onnx",
-                    save_path=onnx_model_save_path,
-                    sample_input=(trainer.state.batch,{}),
-                    dynamic_axes={'input_ids' :{0 : 'batch_size',1: 'sentence_length'},
-                                  'attention_mask' :{0 : 'batch_size',1: 'sentence_length'},
-                                  'output': {0: 'batch_size'}}
-                )
-    else:
-        print("Skipping ONNX model")
+    #             export_for_inference(
+    #                 model=composer_model,
+    #                 save_format="onnx",
+    #                 save_path=onnx_model_save_path,
+    #                 sample_input=(trainer.state.batch,{}),
+    #                 dynamic_axes={'input_ids' :{0 : 'batch_size',1: 'sentence_length'},
+    #                               'attention_mask' :{0 : 'batch_size',1: 'sentence_length'},
+    #                               'output': {0: 'batch_size'}}
+    #             )
+    # else:
+    #     print("Skipping ONNX model")
     #endregion
 
 
