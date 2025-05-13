@@ -92,11 +92,11 @@ def load_data(local_dir: str, taxcode_file: str = None):
     return ds, label_encoder, taxcode_descriptions
 
 
-def tokenize_dataset(sample, tokenizer, label_encoder, label_column, maxlen, taxcode_descriptions=None):
+def tokenize_dataset(tokenizer, label_encoder, label_column, maxlen, taxcode_descriptions, sample):
     """Tokenize a single example from the dataset."""
     # Tokenize the text
     tokenized = tokenizer(
-        sample[feature_column],  # Use feature_column instead of "text"
+        sample[feature_column],
         padding="max_length",
         max_length=maxlen,
         truncation=True,
@@ -428,11 +428,11 @@ if __name__ == "__main__":
     # region prepare_datasets
     p_tokenized = partial(
         tokenize_dataset,
-        tokenizer,
-        label_encoder,
-        label_column,
-        max_len,
-        taxcode_descriptions
+        tokenizer=tokenizer,
+        label_encoder=label_encoder,
+        label_column=label_column,
+        maxlen=max_len,
+        taxcode_descriptions=taxcode_descriptions
     )
 
     vestigial_columns = set()
