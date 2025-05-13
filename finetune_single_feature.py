@@ -1,47 +1,60 @@
-import tabulate
-import transformers
-import boto3
-from multiprocessing import cpu_count
-import composer
-# import composer.functional as cf
-
-# from composer.algorithms import FusedLayerNorm
-# from composer.algorithms import GatedLinearUnits
-from composer.devices import DeviceGPU
-# from composer.utils.object_store import S3ObjectStore
-from torchmetrics import Accuracy
-from torchmetrics import F1Score
-from composer.models.huggingface import HuggingFaceModel
-from composer.metrics import CrossEntropy
-from composer.optim import DecoupledAdamW
-import torch
-from composer import Trainer
-from datasets import load_dataset, Features, Value
-import os
-import json
-from functools import partial
-from sklearn.preprocessing import LabelEncoder
-from torch.utils.data import DataLoader
-
-import numpy as np
-import yaml
-from composer.utils import dist
-from sklearn.metrics import classification_report
-from composer import Callback, Event, Logger, State
-from datasets.utils import disable_progress_bar
-import time
+# Standard library imports
 import datetime
-# from pysrc.inference_export import export_for_inference
+from datetime import datetime as DateTime
+from functools import partial
+import json
+from multiprocessing import cpu_count
+import os
+import shutil
+import time
+
+# Third-party imports
+import boto3
+import composer
+from composer import Callback, Event, Logger, State, Trainer
+from composer.devices import DeviceGPU
+from composer.metrics import CrossEntropy
+from composer.models.huggingface import HuggingFaceModel
+from composer.optim import DecoupledAdamW
+from composer.utils import dist, get_device
+from datasets import load_dataset, Features, Value
+import mlflow
+import numpy as np
 import pandas as pd
+from sklearn.metrics import classification_report
+from sklearn.preprocessing import LabelEncoder
+import tabulate
+import torch
+from torch.utils.data import DataLoader
+from torchmetrics import Accuracy, F1Score
+import transformers
+from sentence_transformers import SentenceTransformer, util
+
+# Local imports
+from pysrc.inference_export import export_for_inference, get_trainer_config
 
 
+mlflow.set_tracking_uri("https://hercule-mlflow.gamma.qa.us-west-2.aws.avalara.io/")
 
-TRAINING_COLUMNS = ["input_ids", "attention_mask", "labels"]
+TRAINING_COLUMNS = ["input_ids", "attention_mask", "labels", "similarity_scores"]
 # label_column = "taxcode"
 label_column = "label"
-feature_column = 'input'
+feature_column = "input"
 
-def load_data(local_dir: str):
+
+def compute_similarity_scores(input_texts, taxcode_descriptions, model_name='all-MiniLM-L6-v2'):
+    """Compute similarity scores between input texts and taxcode descriptions."""
+    sbert = SentenceTransformer(model_name)
+    # Embed taxcode descriptions once
+    tax_embeds = sbert.encode(taxcode_descriptions, convert_to_tensor=True)
+    # Embed all input texts
+    input_embeds = sbert.encode(input_texts, convert_to_tensor=True)
+    # Compute cosine similarity matrix
+    sim_matrix = util.pytorch_cos_sim(input_embeds, tax_embeds).cpu().numpy()
+    return sim_matrix
+
+
+def load_data(local_dir: str, taxcode_file: str = None):
     dfs = {}
     for s in ["train", "test", "validation"]:
         lp = f"{local_dir.rstrip('/')}/{s}"
@@ -49,7 +62,12 @@ def load_data(local_dir: str):
             # print(f"{lp} exists. loading dataset")
             dfs[s] = f"{local_dir.rstrip('/')}/{s}/*.csv"
 
-    features = Features({feature_column: Value(dtype='string', id=None), label_column: Value(dtype='string', id=None)})
+    features = Features(
+        {
+            feature_column: Value(dtype="string", id=None),
+            label_column: Value(dtype="string", id=None),
+        }
+    )
     ds = load_dataset("csv", data_files=dfs, features=features)
 
     all_labels = set()
@@ -64,10 +82,17 @@ def load_data(local_dir: str):
         f"\nFound following datasets under {local_dir} \n{json.dumps(dfs)}\n{len(label_encoder.classes_)} labels fit"
     )
 
-    return ds, label_encoder
+    # Load taxcode descriptions if provided
+    taxcode_descriptions = None
+    if taxcode_file and os.path.exists(taxcode_file):
+        tax_df = pd.read_csv(taxcode_file)
+        taxcode_descriptions = tax_df['Combined_Text'].tolist()
+        print(f"Loaded {len(taxcode_descriptions)} taxcode descriptions")
+
+    return ds, label_encoder, taxcode_descriptions
 
 
-def tokenize_dataset(tokenizer, max_length, label_encoder, sample):
+def tokenize_dataset(tokenizer, max_length, label_encoder, taxcode_descriptions, sample):
     src = tokenizer(
         sample[feature_column],
         padding="max_length",
@@ -76,11 +101,20 @@ def tokenize_dataset(tokenizer, max_length, label_encoder, sample):
     )
     labels = sample[label_column]
     tgt = label_encoder.transform(labels)
+    
+    # Compute similarity scores if taxcode descriptions are available
+    similarity_scores = None
+    if taxcode_descriptions:
+        similarity_scores = compute_similarity_scores([sample[feature_column]], taxcode_descriptions)[0]
+    
     encodings = {
         "input_ids": src["input_ids"],
         "attention_mask": src["attention_mask"],
         "labels": tgt,
     }
+    if similarity_scores is not None:
+        encodings["similarity_scores"] = similarity_scores
+    
     return encodings
 
 
@@ -157,20 +191,102 @@ def s3_sync(s3_path: str, local_dir: str, pull=True) -> None:
     #
 
 
-def __from_params_file(params_file):
-    disable_progress_bar()
-    trainer_config = {}
-    with open(params_file) as f:
-        trainer_config = yaml.safe_load(f)
-    return trainer_config
+def create_and_save_pbtxt(model_name, save_path, max_seq_len, labels):
+    if model_name is None:
+        model_name = "default_model"
+    with open(save_path + "config.pbtxt", "w") as f:
+        f.write(
+            f"""name: "{model_name}"
+            backend: "tensorrt"
+            max_batch_size: {32 if "bulk" in save_path else 8}
+            instance_group [
+            {{
+                count: 1
+                kind: KIND_GPU
+            }}
+            ]
+            input: [
+            {{
+                name: "input_ids",
+                data_type: TYPE_INT32,
+                dims: [{max_seq_len}]
+            }},
+            {{
+                name: "attention_mask",
+                data_type: TYPE_INT32,
+                dims: [{max_seq_len}]
+            }}
+            ]
+            output: [
+            {{
+                name: "output",
+                data_type: TYPE_FP32,
+                dims: [{labels}]
+            }}
+            ]"""
+        )
 
 
-def get_trainer_config():
-    params_file = "/mnt/config/parameters.yaml"
-    return __from_params_file(params_file)
+def freeze_layers_except_last_n(model, n_layers):
+    # First freeze everything
+    for param in model.parameters():
+        param.requires_grad = False
+    layers_to_train = 0
+
+    # For BERT-like models
+    if hasattr(model, "bert"):
+        # Unfreeze the last n transformer layers
+        for layer in model.bert.encoder.layer[-n_layers:]:
+            for param in layer.parameters():
+                param.requires_grad = True
+                layers_to_train += 1
+
+    # For RoBERTa-like models
+    elif hasattr(model, "roberta"):
+        # Unfreeze the last n transformer layers
+        for layer in model.roberta.encoder.layer[-n_layers:]:
+            for param in layer.parameters():
+                param.requires_grad = True
+                layers_to_train += 1
+
+    elif hasattr(model, "distilbert"):  # distilbert
+        # Unfreeze the last n transformer layers
+        for layer in model.distilbert.transformer.layer[-n_layers:]:
+            for param in layer.parameters():
+                param.requires_grad = True
+                layers_to_train += 1
+
+    elif hasattr(model, "model"):  # modernbert
+        # Unfreeze the last n transformer layers
+        for layer in model.model.layers[-n_layers:]:
+            for param in layer.parameters():
+                param.requires_grad = True
+                layers_to_train += 1
+
+    print(f"Last n trainable layers: {layers_to_train}")
+
+    # Always unfreeze the classification head
+    if hasattr(model, "classifier"):
+        for param in model.classifier.parameters():
+            param.requires_grad = True
+
+
+# Print trainable parameters to verify
+def count_trainable_parameters(model):
+    trainable_params = 0
+    all_param = 0
+    for param in model.parameters():
+        all_param += param.numel()
+        if param.requires_grad:
+            trainable_params += param.numel()
+    print(
+        f"trainable params: {trainable_params:,d} || all params: {all_param:,d} "
+        f"|| trainable%: {100 * trainable_params / all_param:.2f}"
+    )
+
 
 class BatchLoggerCallback(Callback):
-    def __init__(self,batch_size,train_records,global_train_batch_size):
+    def __init__(self, batch_size, train_records, global_train_batch_size):
         print("Batch logger initialized")
         self.log_interval = batch_size
         self.st = time.time()
@@ -196,451 +312,175 @@ class BatchLoggerCallback(Callback):
 
         if event == Event.EPOCH_END:
             self.epoch_nd = time.time()
-            print(f"{(self.epoch_nd - self.epoch_st):0.2f}s epoch {self.epoch} -  loss {state.loss}")
+            print(
+                f"{(self.epoch_nd - self.epoch_st):0.2f}s epoch {self.epoch} -  loss {state.loss}"
+            )
             self.epoch += 1
             self.epoch_st = time.time()
 
-
         if event == Event.BATCH_END:
             if self.batch_count >= self.log_interval:
-                self.nd  = time.time()
-                print(f"{(self.nd - self.st):0.2f}s / {self.log_interval} batches Done - {self.total} epoch {self.epoch} -  loss {state.loss}")
+                self.nd = time.time()
+                print(
+                    f"{(self.nd - self.st):0.2f}s / {self.log_interval} batches Done - {self.total} epoch {self.epoch} -  loss {state.loss}"
+                )
                 self.batch_count = 0
 
+
+class DistilBertWithSimilarity(torch.nn.Module):
+    def __init__(self, num_labels, num_taxcodes, model_name='distilbert-base-uncased'):
+        super().__init__()
+        self.bert = transformers.DistilBertModel.from_pretrained(model_name)
+        hidden_size = self.bert.config.hidden_size
+        self.dropout = torch.nn.Dropout(0.1)
+        # classifier accepts [CLS] embedding + similarity vector
+        self.classifier = torch.nn.Linear(hidden_size + num_taxcodes, num_labels)
+
+    def forward(self, input_ids, attention_mask, similarity_scores=None, labels=None):
+        outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
+        cls_embed = outputs.last_hidden_state[:, 0]  # [CLS]
+        x = self.dropout(cls_embed)
+        
+        if similarity_scores is not None:
+            x = torch.cat([x, similarity_scores], dim=1)
+        
+        logits = self.classifier(x)
+        loss = None
+        if labels is not None:
+            loss_fn = torch.nn.CrossEntropyLoss()
+            loss = loss_fn(logits, labels)
+        return {'loss': loss, 'logits': logits}
+
+
+def create_model(train_config, num_labels, num_taxcodes=None):
+    model_name = train_config.get("model", "distilbert-base-uncased")
+    
+    if num_taxcodes is not None:
+        # Use custom model with similarity scores
+        model = DistilBertWithSimilarity(
+            num_labels=num_labels,
+            num_taxcodes=num_taxcodes,
+            model_name=model_name
+        )
+    else:
+        # Use standard HuggingFace model
+        model = transformers.DistilBertForSequenceClassification.from_pretrained(
+            model_name,
+            num_labels=num_labels
+        )
+    
+    return model
+
+
 if __name__ == "__main__":
-    # we need
-    # 1. path to the pre trained model
-    # 2. path to the dataset
-    # region args
+    # region prepare config
     train_config = get_trainer_config()
-    if train_config["dataset"] is None:
-        raise Exception("dataset path mandatory")
+    print(f"train_config: {train_config}")
 
-    # save_onnx = str(train_config.get("save_onnx","true")).strip().lower() in ["true"]
+    # region prepare paths
+    local_data_dir = train_config.get("dataset", None)
+    if local_data_dir.startswith("s3://"):
+        local_data_dir = "/tmp/data"
+        s3_sync(train_config.get("dataset"), local_data_dir, pull=True)
 
-    # region prepare_disk
-    w = train_config["workdir"].rstrip("/")
-    local_data_dir = f"{w}/data/"
-    local_model_dir = f"{w}/model/"
-    checkpoint_dir = f"{w}/checkpoint/"
-    final_model_dir = f"{w}/trained_model/"
-    labels_path = f"{final_model_dir.rstrip('/')}/classes.npy"
-    for d in [local_data_dir, local_model_dir, final_model_dir]:
-        os.makedirs(d, exist_ok=True)
-    # endregion
+    local_model_dir = train_config.get("s3_out_dest", None)
+    if local_model_dir.startswith("s3://"):
+        local_model_dir = "/tmp/model"
+        os.makedirs(local_model_dir, exist_ok=True)
 
-    # region download_data_models
-    #composer.utils.dist.initialize_dist(composer.trainer.devices.DeviceGPU(), timeout=datetime.timedelta(seconds=300))
-    # the composer version 11, throws an error if ^^ is used
-    # upgrade the composer version to 11 in the yaml if you see
-    # TypeError: unsupported type for timedelta seconds component: datetime.timedelta
-    composer.utils.dist.initialize_dist(DeviceGPU(), timeout=1000)
-    with dist.run_local_rank_zero_first():
-        if (
-            train_config.get("pretrained", None)
-            and len(train_config["pretrained"].strip()) > 0
-        ):
-            pretrained_model = train_config["pretrained"].strip().rstrip('/')
-            pretrained_model = f"{pretrained_model}/"
-            s3_sync(s3_path=pretrained_model, local_dir=f"{w}/model/")
-
-        if not train_config.get("skip_ds_download", False):
-            s3_sync(s3_path=train_config["dataset"], local_dir=f"{w}/data/")
+    labels_path = os.path.join(local_model_dir, "classes.npy")
     # endregion
 
     # region prepare label encoder
-    ds, label_encoder = load_data(local_dir=local_data_dir)
+    ds, label_encoder, taxcode_descriptions = load_data(
+        local_dir=local_data_dir,
+        taxcode_file=train_config.get("taxcode_file", None)
+    )
     num_labels = len(label_encoder.classes_)
     np.save(labels_path, label_encoder.classes_)
     # endregion
 
-    # Build a blank model from the config
-    model_name_or_location = local_model_dir if train_config.get("pretrained", None) else train_config["model"]
-    config = transformers.AutoConfig.from_pretrained(model_name_or_location, num_labels=num_labels)
+    # region prepare tokenizer
+    tokenizer = transformers.DistilBertTokenizerFast.from_pretrained(
+        train_config.get("model", "distilbert-base-uncased")
+    )
+    max_len = train_config.get("maxlen", 256)
+    # endregion
 
-    print(config.to_json_string())
-
-    print("Loading model from ",model_name_or_location)
-
-    hf_model = transformers.AutoModelForSequenceClassification.from_config(config)
-
-    print("Loading tokenizer from ",model_name_or_location)
-    tokenizer = transformers.AutoTokenizer.from_pretrained(model_name_or_location)
-    
-
-    max_len = int(train_config["maxlen"])
-    global_train_batch_size = int(train_config.get("train_batch_size",250))
-    global_eval_batch_size = int(train_config.get("eval_batch_size",500))
-
-    save_composer_checkpoint = str(train_config.get("save_composer_checkpoint","true")).strip().lower() in ["true"]
-    save_pytorch_bin = train_config.get("save_pytorch_bin","true").strip().lower() in ["true"]
-
-    device_train_batch_size = global_train_batch_size // dist.get_world_size()
-    device_eval_batch_size = global_eval_batch_size // dist.get_world_size()
-
-    #region prepare_datasets
-    p_tokenized = partial(tokenize_dataset, tokenizer, max_len, label_encoder)
+    # region prepare_datasets
+    p_tokenized = partial(
+        tokenize_dataset,
+        tokenizer,
+        max_len,
+        label_encoder,
+        taxcode_descriptions
+    )
 
     vestigial_columns = set()
-    for k, d in ds.items():
-        for c in d.column_names:
-            if c not in TRAINING_COLUMNS:
-                vestigial_columns.add(c)
+    for k, vds in ds.items():
+        vestigial_columns.update(vds.column_names)
+    vestigial_columns = vestigial_columns - set(TRAINING_COLUMNS)
 
-    print(f"Removing {vestigial_columns}")
-
-    tokenized_datasets = ds.map(
-        function=p_tokenized,
-        batched=True,
-        num_proc=cpu_count(),
-        remove_columns=list(vestigial_columns),
+    ds = ds.map(
+        p_tokenized,
+        batched=False,
+        remove_columns=vestigial_columns,
+        desc=f"tokenizing {k}",
     )
-    for k, d in tokenized_datasets.items():
-        d.set_format(type="torch", columns=TRAINING_COLUMNS)
+    # endregion
 
-    data_collator = transformers.data.data_collator.default_data_collator
-    train_dataset = tokenized_datasets["train"]
-    train_dataloader = DataLoader(
-        dataset=train_dataset,
-        batch_size=device_train_batch_size,
-        sampler=dist.get_sampler(train_dataset, drop_last=False, shuffle=True),
-        drop_last=False,
-        collate_fn=data_collator,
-    )
-    validation_dataset = tokenized_datasets["validation"]
-    eval_dataloader = DataLoader(
-        dataset=validation_dataset,
-        batch_size=device_eval_batch_size,
-        sampler=dist.get_sampler(validation_dataset, drop_last=False, shuffle=False),
-        drop_last=False,
-        collate_fn=data_collator,
-    )
-    # No DistributedSampler for the test_dataloader
-    # because it is used in a trainer.predict loop that only tracks results from rank0
-    # TODO? Make the predict loop PredictionCallback compatible with multi-gpu
-    test_dataset = tokenized_datasets["test"]
-    test_dataloader = DataLoader(
-        dataset=test_dataset,
-        batch_size=device_eval_batch_size,
-        shuffle=False,
-        drop_last=False,
-        collate_fn=data_collator,
-        sampler=None #dist.get_sampler(validation_dataset, drop_last=False, shuffle=False),
-    )
+    # region prepare model
+    num_taxcodes = len(taxcode_descriptions) if taxcode_descriptions else None
+    model = create_model(train_config, num_labels, num_taxcodes)
+    # endregion
 
-    print(f"Datasets tokenized {tokenized_datasets.shape}")
-    #endregion
-
-    metrics = [CrossEntropy(), Accuracy(task='multiclass', num_classes=num_labels), F1Score(task="multiclass", num_classes=num_labels)]
-    # Package as a composer model
-    composer_model = HuggingFaceModel(model=hf_model, tokenizer=tokenizer, metrics=metrics, use_logits=True)
-    try:
-      composer_model.model_inputs.remove('token_type_ids')
-    except Exception:
-      print("Unable to remove token_type_ids from composer_model.model_inputs")
-
-    # Apply surgery algorithms using functional API
-    # algorithms = train_config.get('algorithms',[])
-    # if algorithms is not None and len(algorithms) > 0:
-    #     # write out the algorithms and other special layers included
-    #     # so that we can re-apply them when we initialize the models.
-    #     composer_config_file = os.path.join(final_model_dir, "composer_config.json")
-    #     ccfg = { 'algorithms': algorithms }
-    #     with open(composer_config_file,'w') as fd:
-    #         json.dump(ccfg,fd,indent=2)
-
-    #     if 'GatedLinearUnits' in algorithms:
-    #         cf.apply_gated_linear_units(composer_model, optimizers=None)
-    #     if 'FusedLayerNorm' in algorithms:
-    #         cf.apply_fused_layernorm(composer_model, optimizers=None)
-    #     if 'Alibi' in algorithms:
-    #         cf.apply_alibi(composer_model,optimizers=None,max_sequence_length=256)
-
-    if train_config.get("print_composer",False):
-        print(composer_model)
-
-    # Load the weights
-    if train_config.get("load_as_weights", False):
-        pretrained_hf_state_dict = torch.load(os.path.join(local_model_dir, "pytorch_model.bin"))
-        #missing_keys, unexpected_keys = composer_model.model.load_state_dict(pretrained_hf_state_dict, strict=False)
-        missing_keys, unexpected_keys = composer_model.load_state_dict(pretrained_hf_state_dict, strict=False)
-        if len(missing_keys) > 0:
-            print ("MISSING_KEYS")
-            for k in missing_keys:
-                print (k)
-        else:
-            print("No missing keys: OK")
-
-        if len(unexpected_keys) > 0:
-            print ("UNEXPECTED_KEYS")
-            for k in (unexpected_keys):
-                print (k)
-        else:
-            print("No unexpected keys: OK")
-
-    # if 'Alibi' in algorithms:
-    #     cf.apply_alibi(composer_model,optimizers=None,max_sequence_length=256)
-        
-    adam_lr=float(train_config["optimizer"]["adam"]["lr"])
-    adam_beta_st=float(train_config["optimizer"]["adam"]["betas"][0])
-    adam_beta_nd=float(train_config["optimizer"]["adam"]["betas"][1])
-    adam_eps=float(train_config["optimizer"]["adam"]["eps"])
-    adam_weight_decay=float(train_config["optimizer"]["adam"]["weight_decay"])
-
-    optimizer = DecoupledAdamW(
-        params=composer_model.parameters(),
-        lr=adam_lr,
-        betas=(adam_beta_st,adam_beta_nd),
-        eps=adam_eps,
-        weight_decay=adam_weight_decay
-    )
-
-    print(train_config["optimizer"]["adam"])
-    print(train_config["scheduler"]["linear_scheduler"])
-
-    ls_alpha_i=float(train_config["scheduler"]["linear_scheduler"]["alpha_i"])
-    ls_alpha_f=float(train_config["scheduler"]["linear_scheduler"]["alpha_f"])
-    t_max=train_config["scheduler"]["linear_scheduler"]["t_max"]
-
-    linear_lr_decay = composer.optim.scheduler.LinearScheduler(alpha_i=ls_alpha_i, alpha_f=ls_alpha_f, t_max=t_max)
-
-    algorithms = []
-    
-    print(f"Composer version: {composer.__version__}")
-
-    # from composer.loggers import ObjectStoreLogger
-    # 
-    # object_store_logger = ObjectStoreLogger(
-    #     object_store_cls=S3ObjectStore,
-    #     object_store_kwargs={
-    #         'bucket':'mosaicml-68c98fa5-0b21-4c7b-b40b-c4482db8832a',
-    #     }
-    # )
-    # loggers=[object_store_logger, TensorboardLogger(flush_interval=10)]
-    loggers = []
-    # c4_algorithms=[
-    #     composer.algorithms.GatedLinearUnits(),
-    #     composer.algorithms.Alibi(max_sequence_length=128, train_sequence_length_scaling=1.0),
-    #     composer.algorithms.FusedLayerNorm(),
-    # ]
-    #
-    train_records = tokenized_datasets.get('train').shape[0] if 'train' in tokenized_datasets else 0
-
-    # Create Trainer Object
+    # region prepare trainer
     trainer = Trainer(
-        model=composer_model,
-        run_name=os.environ.get("RUN_NAME"),
-        # console_log_level="batch",
-        train_dataloader=train_dataloader,
-        eval_dataloader=eval_dataloader,
-        max_duration=train_config.get("max_duration", "1ep"),
-        optimizers=optimizer,
-        schedulers=[linear_lr_decay],
-        # grad_accum=train_config.get("grad_accum","auto"),
-        loggers=loggers,
-        algorithms=algorithms, 
-        device="gpu" if torch.cuda.is_available() else "cpu",
-        train_subset_num_batches=int(train_config.get("train_subset_num_batches", -1)),
-        eval_subset_num_batches=int(train_config.get("eval_subset_num_batches", -1)),
-        precision=train_config.get("precision", "fp32"),
-        seed=17,
-        save_folder=checkpoint_dir,
-        save_weights_only=True,
-        save_overwrite=True,
-        save_latest_filename="latest",
-        save_interval=train_config.get("save_interval", "1ep"),
-        callbacks=[BatchLoggerCallback(batch_size=train_config.get("log_every_x_batches",1000),
-                                       train_records=train_records,
-                                       global_train_batch_size=global_train_batch_size)
-                   ],
-        progress_bar=train_config.get("progress_bar",True),
-        log_to_console=train_config.get("log_to_console",None),
-    )
-
-    trn_st = time.time()
-    print("Starting training")
-    # Start training
-    trainer.fit()
-    trn_nd = time.time()
-    training_time = str(datetime.timedelta(seconds=trn_nd-trn_st))
-    print(f"Training and validation done. {training_time}")
-
-    print(trainer.state.eval_metrics)
-
-    # from composer.utils.checkpoint import save_checkpoint
-    # final_state_file = os.path.join(final_model_dir,"fs_composer_state.pt")
-    # sfn = save_checkpoint(trainer.state,final_state_file,weights_only=True)
-
-    with dist.run_local_rank_zero_first():
-        if dist.get_global_rank() == 0:
-            hf_model.save_pretrained(final_model_dir)
-            tokenizer.save_pretrained(final_model_dir)
-            print(f"pytorch model saved to {final_model_dir}")
-
-    #region prediction loop
-    print("Starting Prediction on test_dataloader")
-    trainer.state.model.eval()
-    y_true = []
-    y_pred = []
-    probs = []
-    final_res = []
-
-
-    # probs = fn(logits, **params)
-    #
-    # # Apply filters
-    # assert probs.shape == filters_mask.shape
-    # probs = torch.mul(probs, filters_mask)
-    #
-    # probs, ix = torch.topk(probs, k=len(self.labels), dim=-1)
-
-    from composer.utils import get_device
-    with torch.no_grad():
-        _device = get_device("gpu" if torch.cuda.is_available() else "cpu")
-        for batch in test_dataloader:
-            #batch = trainer._device.batch_to_device(batch)
-            batch = _device.batch_to_device(batch)
-            # batch = trainer.device.batch_to_device(batch)
-            y_true.extend(batch['labels'].cpu().numpy())
-            predicted = trainer.state.model(batch)
-            logits = predicted.logits.detach().cpu()
-            probs = torch.nn.functional.softmax(logits, dim=-1)
-            probs, ix = torch.topk(probs, k=3, dim=-1)
-            pred_probs = ([[a.item() for a in p] for p in probs])
-            pred_labels = np.apply_along_axis(
-                func1d=label_encoder.inverse_transform, arr=ix, axis=-1
+        model=model,
+        train_dataloader=DataLoader(
+            ds["train"],
+            batch_size=train_config.get("train_batch_size", 128),
+            shuffle=True,
+        ),
+        eval_dataloader=DataLoader(
+            ds["validation"],
+            batch_size=train_config.get("eval_batch_size", 128),
+            shuffle=False,
+        ),
+        max_duration=train_config.get("max_duration", "5ep"),
+        device=DeviceGPU(),
+        callbacks=[
+            BatchLoggerCallback(
+                batch_size=train_config.get("train_batch_size", 128),
+                train_records=len(ds["train"]),
+                global_train_batch_size=train_config.get("train_batch_size", 128)
+                * train_config.get("grad_accum", 1),
             )
-            res = [[(k, l) for k, l in zip(i, j)] for i, j in zip(pred_labels, pred_probs)]
-            final_res.extend(res)
-            for p in predicted.logits:
-                y_pred.append(torch.argmax(p).item())
+        ],
+    )
+    # endregion
 
-        target_names = list(label_encoder.classes_)
+    # region train
+    trainer.fit()
+    # endregion
 
-        y_true = label_encoder.inverse_transform(y_true)
-        y_pred = label_encoder.inverse_transform(y_pred)
+    # region save model
+    model.save_pretrained(local_model_dir)
+    tokenizer.save_pretrained(local_model_dir)
+    # endregion
 
-        def get_invalids(l,c):
-            invalids = set()
-            for t in c:
-                if t not in l:
-                    invalids.add(t)
-            return invalids
-
-        print(f"Invalid codes in y_true {get_invalids(l=target_names,c=y_true)}")
-        print(f"Invalid codes in y_true {get_invalids(l=target_names,c=y_pred)}")
-        res_df = pd.DataFrame(ds['test'])
-        res_df["y_true"] = y_true
-        res_df["y_pred"] = y_pred
-        ff = pd.DataFrame(final_res, columns=['res_1', 'res_2', 'res_3'])
-        f1 = pd.DataFrame(ff['res_1'].values.tolist(), index=ff.index, columns=['pred_1', 'score_1'])
-        f2 = pd.DataFrame(ff['res_2'].values.tolist(), index=ff.index, columns=['pred_2', 'score_2'])
-        f3 = pd.DataFrame(ff['res_3'].values.tolist(), index=ff.index, columns=['pred_3', 'score_3'])
-        final_res_df = pd.concat([res_df, f1, f2, f3], axis=1)
-        result_file = f"{final_model_dir}/predictions.tsv"
-        final_res_df.to_csv(result_file, sep='\t', index=False)
-
-        # str_cr = classification_report(
-        #     y_true=y_true, y_pred=y_pred, labels=label_encoder.classes_,target_names=target_names,
-        #     zero_division=0
-        # )
-
-        json_cr = classification_report(
-            y_true=y_true, y_pred=y_pred, labels=label_encoder.classes_,output_dict=True,target_names=target_names,
-            zero_division=0
+    # region export for inference
+    if train_config.get("save_tensorrt", False):
+        export_for_inference(
+            model_dir=local_model_dir,
+            bulk_s3_out_dest=train_config.get("bulk_s3_out_dest", None),
+            single_s3_out_dest=train_config.get("single_s3_out_dest", None),
+            max_seq_len=max_len,
+            labels=label_encoder.classes_,
         )
+    # endregion
 
-        koi = ["precision","recall","f1-score","support"]
-        rows = []
-        for k in json_cr.keys():
-            if k in ["accuracy"]:
-                continue
-            row = [k]
-            for n in koi:
-                row.append(json_cr[k][n])
-            rows.append(row)
-        rows.sort(key=lambda x : x[-1],reverse=True)
-        headers = ["label","precision","recall","f1-score","support"]
-        import tabulate
-        str_cr = tabulate.tabulate(rows,headers=headers)
-        print(str_cr)
-
-        cr_file = os.path.join(final_model_dir,"cr.txt")
-        json_cr_file = os.path.join(final_model_dir,"cr.json")
-
-        with open(cr_file, "w") as w:
-            w.write(str_cr)
-
-        with open(json_cr_file, "w") as w:
-            json.dump(json_cr,w,indent=1)
-    #endregion
-
-
-    #region export for inference using ONNX
-    # if save_onnx:
-    #     with dist.run_local_rank_zero_first():
-    #         if dist.get_global_rank() == 0:
-    #             onnx_model_save_path = os.path.join(final_model_dir, 'model2.onnx')
-
-    #             # print(trainer.state.batch)
-    #             print(trainer.state.batch.keys())
-    #             sample_input = trainer.state.batch
-    #             # the keys when we tokenize will be
-    #             # input_ids, attention_mask
-    #             # remove all other keys
-    #             if 'labels' in sample_input:
-    #                 del sample_input['labels']
-
-    #             # ONNX export requires all values to be moved to the CPU
-    #             device = torch.device('cpu')
-    #             composer_model.to(device=device)
-    #             for key, value in sample_input.items():
-    #                 sample_input[key] = value.to(device=device)
-
-    #             export_for_inference(
-    #                 model=composer_model,
-    #                 save_format="onnx",
-    #                 save_path=onnx_model_save_path,
-    #                 sample_input=(trainer.state.batch,{}),
-    #                 dynamic_axes={'input_ids' :{0 : 'batch_size',1: 'sentence_length'},
-    #                               'attention_mask' :{0 : 'batch_size',1: 'sentence_length'},
-    #                               'output': {0: 'batch_size'}}
-    #             )
-    # else:
-    #     print("Skipping ONNX model")
-    #endregion
-
-
-
-
-    #region move final_model_dir to s3
-    with dist.run_local_rank_zero_first():
-        if dist.get_global_rank() == 0:
-            s3_out_dir = train_config.get("s3_out_dest", None)
-            import shutil
-            copy_files = ["args.json","input_text_config_"]
-            for f in os.listdir(local_data_dir):
-                do_copy = False
-                for c in copy_files:
-                    if f.startswith(c):
-                        do_copy = True
-                        break
-                if do_copy:
-                    src_file = os.path.join(local_data_dir,f)
-                    dst_file = os.path.join(final_model_dir,f)
-                    shutil.copy(src=src_file,dst=dst_file)
-                    print(f"Copied {src_file} to {dst_file}")
-
-            if s3_out_dir is not None:
-                s3_out_dir = s3_out_dir.rstrip("/")
-                from datetime import datetime
-                s = datetime.now()
-                rnd = f"{s}".split()[1].split(".")[0].replace(":","-")
-                dt = f"{s}".split()[0].split(".")[0].replace(":","-")
-                ym = trainer.state.run_name
-                s3_path = f"{s3_out_dir}/{rnd}_{dt}_{ym}/"
-                print("Writing model to ",s3_path)
-                s3_sync(s3_path=s3_path, local_dir=final_model_dir, pull=False)
-    #endregion
-
-
+    # region upload to s3
+    if train_config.get("s3_out_dest", None).startswith("s3://"):
+        s3_sync(train_config.get("s3_out_dest"), local_model_dir, pull=False)
+    # endregion
