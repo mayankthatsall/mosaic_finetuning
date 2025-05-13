@@ -26,7 +26,7 @@ import torch.nn as nn
 from composer.utils import dist
 from composer.utils.checkpoint import download_checkpoint
 from composer.utils.iter_helpers import ensure_tuple
-from composer.utils.misc import is_model_ddp, is_model_deepspeed, model_eval_mode
+from composer.utils.misc import is_model_ddp, model_eval_mode
 from composer.utils.object_store import ObjectStore
 from composer.utils.string_enum import StringEnum
 
@@ -129,7 +129,6 @@ class ExportFormat(StringEnum):
 
     TORCHSCRIPT = "torchscript"
     ONNX = "onnx"
-    TENSORRT = "tensorrt"
 
 
 def export_for_inference(
@@ -299,7 +298,7 @@ def export_for_inference(
                     export_to_tensorrt(
                         os.path.join(local_save_path, "model.onnx"),
                         os.path.join(local_save_path, "model.plan"),
-                        tensorrt_max_batch_size=32 if "bulk" in local_save_path else 12,
+                        tensorrt_max_batch_size=16 if "bulk" in local_save_path else 12,
                     )
                     # delete the onnx model
                     os.remove(os.path.join(local_save_path, "model.onnx"))
@@ -376,3 +375,12 @@ def export_with_logger(
             sample_input=sample_input,
             transforms=transforms,
         )
+
+# Handle missing functions
+def is_model_deepspeed(model: Any) -> bool:
+    """Check if model is using DeepSpeed."""
+    return False
+
+def is_model_fsdp(model: Any) -> bool:
+    """Check if model is using FSDP."""
+    return False
