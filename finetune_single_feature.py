@@ -92,30 +92,48 @@ def load_data(local_dir: str, taxcode_file: str = None):
     return ds, label_encoder, taxcode_descriptions
 
 
-def tokenize_dataset(tokenizer, max_length, label_encoder, taxcode_descriptions, sample):
-    src = tokenizer(
-        sample[feature_column],
+def tokenize_dataset(sample, tokenizer, label_encoder, label_column, maxlen, taxcode_descriptions=None):
+    """Tokenize a single example from the dataset."""
+    # Tokenize the text
+    tokenized = tokenizer(
+        sample["text"],
         padding="max_length",
-        max_length=max_length,
+        max_length=maxlen,
         truncation=True,
     )
-    labels = sample[label_column]
-    tgt = label_encoder.transform(labels)
     
+    # Handle labels - ensure it's a list/array
+    labels = sample[label_column]
+    if not isinstance(labels, (list, np.ndarray)):
+        labels = [labels]
+    
+    # Transform labels to numeric values
+    try:
+        tgt = label_encoder.transform(labels)
+    except ValueError as e:
+        print(f"Warning: Invalid label found: {labels}")
+        # Return a default value or skip this example
+        return None
+
     # Compute similarity scores if taxcode descriptions are available
     similarity_scores = None
-    if taxcode_descriptions:
-        similarity_scores = compute_similarity_scores([sample[feature_column]], taxcode_descriptions)[0]
-    
-    encodings = {
-        "input_ids": src["input_ids"],
-        "attention_mask": src["attention_mask"],
+    if taxcode_descriptions is not None:
+        # Get the taxcode description for this example
+        taxcode_desc = taxcode_descriptions.get(sample[label_column], "")
+        if taxcode_desc:
+            # Compute similarity between the text and taxcode description
+            similarity_scores = compute_similarity_scores([sample["text"]], [taxcode_desc])[0][0][0]
+
+    # Combine all features
+    result = {
+        **tokenized,
         "labels": tgt,
     }
-    if similarity_scores is not None:
-        encodings["similarity_scores"] = similarity_scores
     
-    return encodings
+    if similarity_scores is not None:
+        result["similarity_scores"] = similarity_scores
+        
+    return result
 
 
 def s3_sync(s3_path: str, local_dir: str, pull=True) -> None:
@@ -411,8 +429,9 @@ if __name__ == "__main__":
     p_tokenized = partial(
         tokenize_dataset,
         tokenizer,
-        max_len,
         label_encoder,
+        label_column,
+        max_len,
         taxcode_descriptions
     )
 
@@ -425,7 +444,10 @@ if __name__ == "__main__":
         p_tokenized,
         batched=False,
         remove_columns=vestigial_columns,
-        desc=f"tokenizing {k}",
+        desc="Tokenizing dataset",
+    ).filter(
+        lambda x: x is not None,  # Remove any None values
+        desc="Filtering invalid examples"
     )
     # endregion
 
