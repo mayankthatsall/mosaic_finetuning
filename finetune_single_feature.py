@@ -96,7 +96,7 @@ def tokenize_dataset(sample, tokenizer, label_encoder, label_column, maxlen, tax
     """Tokenize a single example from the dataset."""
     # Tokenize the text
     tokenized = tokenizer(
-        sample["text"],
+        sample[feature_column],  # Use feature_column instead of "text"
         padding="max_length",
         max_length=maxlen,
         truncation=True,
@@ -122,7 +122,7 @@ def tokenize_dataset(sample, tokenizer, label_encoder, label_column, maxlen, tax
         taxcode_desc = taxcode_descriptions.get(sample[label_column], "")
         if taxcode_desc:
             # Compute similarity between the text and taxcode description
-            similarity_scores = compute_similarity_scores([sample["text"]], [taxcode_desc])[0][0][0]
+            similarity_scores = compute_similarity_scores([sample[feature_column]], [taxcode_desc])[0][0][0]
 
     # Combine all features
     result = {
