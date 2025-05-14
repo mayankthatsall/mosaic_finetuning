@@ -30,6 +30,7 @@ from torchmetrics import Accuracy, F1Score
 import transformers
 from sentence_transformers import SentenceTransformer, util
 from torch.utils.data.distributed import DistributedSampler
+import torch.distributed as dist
 
 # Local imports
 from pysrc.inference_export import export_for_inference, get_trainer_config
@@ -486,6 +487,14 @@ if __name__ == "__main__":
     # endregion
 
     # region prepare trainer
+    # Initialize distributed process group
+    if not dist.is_initialized():
+        dist.init_process_group(backend='nccl')
+
+    # Get local rank from environment variable
+    local_rank = int(os.environ.get('LOCAL_RANK', 0))
+    torch.cuda.set_device(local_rank)
+
     train_sampler = DistributedSampler(ds["train"])
     val_sampler = DistributedSampler(ds["validation"], shuffle=False)
 
