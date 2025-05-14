@@ -29,6 +29,7 @@ from torch.utils.data import DataLoader
 from torchmetrics import Accuracy, F1Score
 import transformers
 from sentence_transformers import SentenceTransformer, util
+from torch.utils.data.distributed import DistributedSampler
 
 # Local imports
 from pysrc.inference_export import export_for_inference, get_trainer_config
@@ -485,17 +486,24 @@ if __name__ == "__main__":
     # endregion
 
     # region prepare trainer
+    train_sampler = DistributedSampler(ds["train"])
+    val_sampler = DistributedSampler(ds["validation"], shuffle=False)
+
     trainer = Trainer(
         model=model,
         train_dataloader=DataLoader(
             ds["train"],
             batch_size=train_config.get("train_batch_size", 128),
-            shuffle=True,
+            sampler=train_sampler,
+            num_workers=4,
+            pin_memory=True,
         ),
         eval_dataloader=DataLoader(
             ds["validation"],
             batch_size=train_config.get("eval_batch_size", 128),
-            shuffle=False,
+            sampler=val_sampler,
+            num_workers=4,
+            pin_memory=True,
         ),
         max_duration=train_config.get("max_duration", "5ep"),
         device=DeviceGPU(),
