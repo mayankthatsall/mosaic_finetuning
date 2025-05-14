@@ -31,6 +31,7 @@ import transformers
 from sentence_transformers import SentenceTransformer, util
 from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
+from composer.core import DataSpec
 
 # Local imports
 from pysrc.inference_export import export_for_inference, get_trainer_config
@@ -412,6 +413,15 @@ class DistilBertComposerModel(ComposerModel):
         return {}
 
 
+class CustomDataSpec(DataSpec):
+    def __init__(self, dataloader):
+        super().__init__(dataloader)
+        
+    def get_num_samples_in_batch(self, batch):
+        # Get the size of the first tensor (input_ids)
+        return batch['input_ids'].size(0)
+
+
 if __name__ == "__main__":
     # region prepare config
     train_config = get_trainer_config()
@@ -498,22 +508,26 @@ if __name__ == "__main__":
     train_sampler = DistributedSampler(ds["train"])
     val_sampler = DistributedSampler(ds["validation"], shuffle=False)
 
+    train_dataloader = DataLoader(
+        ds["train"],
+        batch_size=train_config.get("train_batch_size", 128),
+        sampler=train_sampler,
+        num_workers=4,
+        pin_memory=True,
+    )
+
+    eval_dataloader = DataLoader(
+        ds["validation"],
+        batch_size=train_config.get("eval_batch_size", 128),
+        sampler=val_sampler,
+        num_workers=4,
+        pin_memory=True,
+    )
+
     trainer = Trainer(
         model=model,
-        train_dataloader=DataLoader(
-            ds["train"],
-            batch_size=train_config.get("train_batch_size", 128),
-            sampler=train_sampler,
-            num_workers=4,
-            pin_memory=True,
-        ),
-        eval_dataloader=DataLoader(
-            ds["validation"],
-            batch_size=train_config.get("eval_batch_size", 128),
-            sampler=val_sampler,
-            num_workers=4,
-            pin_memory=True,
-        ),
+        train_dataloader=CustomDataSpec(train_dataloader),
+        eval_dataloader=CustomDataSpec(eval_dataloader),
         max_duration=train_config.get("max_duration", "5ep"),
         device=DeviceGPU(),
         optimizers=optimizer,
