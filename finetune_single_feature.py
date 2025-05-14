@@ -11,7 +11,7 @@ import time
 # Third-party imports
 import boto3
 import composer
-from composer import Callback, Event, Logger, State, Trainer
+from composer import Callback, Event, Logger, State, Trainer, ComposerModel
 from composer.devices import DeviceGPU
 from composer.metrics import CrossEntropy
 from composer.models.huggingface import HuggingFaceModel
@@ -390,6 +390,26 @@ def create_model(train_config, num_labels, num_taxcodes=None):
     return model
 
 
+class DistilBertComposerModel(ComposerModel):
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, batch):
+        return self.model(**batch)
+
+    def loss(self, outputs, batch):
+        return outputs['loss']
+
+    def eval_forward(self, batch, outputs=None):
+        if outputs is None:
+            outputs = self.forward(batch)
+        return outputs
+
+    def get_metrics(self, is_train=False):
+        return {}
+
+
 if __name__ == "__main__":
     # region prepare config
     train_config = get_trainer_config()
@@ -451,7 +471,17 @@ if __name__ == "__main__":
 
     # region prepare model
     num_taxcodes = len(taxcode_descriptions) if taxcode_descriptions else None
-    model = create_model(train_config, num_labels, num_taxcodes)
+    base_model = create_model(train_config, num_labels, num_taxcodes)
+    model = DistilBertComposerModel(base_model)
+
+    # Add optimizer configuration
+    optimizer = DecoupledAdamW(
+        model.parameters(),
+        lr=float(train_config['optimizer']['adam']['lr']),
+        betas=tuple(train_config['optimizer']['adam']['betas']),
+        eps=float(train_config['optimizer']['adam']['eps']),
+        weight_decay=train_config['optimizer']['adam']['weight_decay']
+    )
     # endregion
 
     # region prepare trainer
@@ -469,6 +499,7 @@ if __name__ == "__main__":
         ),
         max_duration=train_config.get("max_duration", "5ep"),
         device=DeviceGPU(),
+        optimizers=optimizer,
         callbacks=[
             BatchLoggerCallback(
                 batch_size=train_config.get("train_batch_size", 128),
