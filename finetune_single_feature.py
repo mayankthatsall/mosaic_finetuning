@@ -420,6 +420,15 @@ class CustomDataSpec(DataSpec):
     def get_num_samples_in_batch(self, batch):
         # Get the size of the first tensor (input_ids)
         return batch['input_ids'].size(0)
+        
+    def batch_transforms(self, batch):
+        # Convert batch to tensors and move to device
+        return {
+            'input_ids': batch['input_ids'],
+            'attention_mask': batch['attention_mask'],
+            'labels': batch['labels'],
+            'similarity_scores': batch.get('similarity_scores', None)
+        }
 
 
 if __name__ == "__main__":
@@ -504,6 +513,9 @@ if __name__ == "__main__":
     # Get local rank from environment variable
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     torch.cuda.set_device(local_rank)
+
+    # Set tokenizer parallelism to false to avoid warnings
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
     train_sampler = DistributedSampler(ds["train"])
     val_sampler = DistributedSampler(ds["validation"], shuffle=False)
