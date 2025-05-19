@@ -103,20 +103,23 @@ def tokenize_with_similarity(tokenizer, max_length, label_encoder, tax_embeds, e
 
 
 def s3_sync(s3_path: str, local_dir: str, pull=True) -> None:
-    """
-    Sync files between S3 and local directory.
-    """
     s3_path = s3_path.strip()
     local_dir = local_dir.strip()
 
     def download_dir(client, resource, prefix, start_prefix, local, bucket):
         paginator = client.get_paginator("list_objects")
         for result in paginator.paginate(Bucket=bucket, Delimiter="/", Prefix=prefix):
+            # Recurse into sub-folders
             for sub in result.get("CommonPrefixes", []):
                 download_dir(client, resource, sub["Prefix"], start_prefix, local, bucket)
+            # Download each object
             for obj in result.get("Contents", []):
                 key = obj["Key"]
+                # Compute relative path; if this is exactly the file prefix, key_relative will be empty
                 rel = key.replace(start_prefix, "").lstrip("/")
+                if not rel:
+                    # we’re downloading the single file itself
+                    rel = os.path.basename(start_prefix)
                 out_path = os.path.join(local, rel)
                 os.makedirs(os.path.dirname(out_path), exist_ok=True)
                 resource.meta.client.download_file(bucket, key, out_path)
