@@ -104,19 +104,30 @@ def tokenize_with_similarity(tokenizer, max_length, label_encoder, tax_embeds, e
 
 def s3_sync(s3_path: str, local_dir: str, pull=True) -> None:
     """
-    Sync files between S3 and local directory.
+    Sync files between S3 and local directory. Supports both directories and single files.
     """
     s3_path = s3_path.strip()
     local_dir = local_dir.strip()
 
+    # Parse bucket and prefix
+    parts = s3_path.replace("s3://", "").split("/", 1)
+    bucket = parts[0]
+    prefix = parts[1] if len(parts) > 1 else ""
+
+    # If pulling a single file (detect by extension), download directly
+    if pull and os.path.splitext(prefix)[1]:
+        os.makedirs(local_dir, exist_ok=True)
+        local_file = os.path.join(local_dir, os.path.basename(prefix))
+        boto3.client('s3').download_file(bucket, prefix, local_file)
+        return
+
+    # Otherwise treat as directory sync
     def download_dir(client, resource, prefix, start_prefix, local, bucket):
-        paginator = client.get_paginator("list_objects")
-        for result in paginator.paginate(Bucket=bucket, Delimiter="/", Prefix=prefix):
-            for sub in result.get("CommonPrefixes", []):
-                download_dir(client, resource, sub["Prefix"], start_prefix, local, bucket)
+        paginator = client.get_paginator("list_objects_v2")
+        for result in paginator.paginate(Bucket=bucket, Prefix=prefix):
             for obj in result.get("Contents", []):
                 key = obj["Key"]
-                rel = key.replace(start_prefix, "").lstrip("/")
+                rel = key[len(start_prefix):].lstrip("/")
                 out_path = os.path.join(local, rel)
                 os.makedirs(os.path.dirname(out_path), exist_ok=True)
                 resource.meta.client.download_file(bucket, key, out_path)
@@ -135,49 +146,10 @@ def s3_sync(s3_path: str, local_dir: str, pull=True) -> None:
                 key = os.path.join(prefix, rel)
                 client.upload_file(local_path, bucket, key)
 
-    parts = s3_path.replace("s3://", "").split("/", 1)
-    bucket = parts[0]
-    prefix = parts[1] if len(parts) > 1 else ""
     if pull:
         pull_prefix(local_dir, bucket, prefix)
     else:
         upload_dir(local_dir, bucket, prefix)
-
-
-def create_and_save_pbtxt(model_name, save_path, max_seq_len, labels):
-    save_path = f"{'/'.join(save_path.split('/')[:-2])}/config.pbtxt"
-    with open(save_path, "w") as f:
-        f.write(
-            f"""name: {model_name}
-backend: \"tensorrt\"
-max_batch_size: {32 if 'bulk' in save_path else 12}
-instance_group [
-{{
-    count: 1
-    kind: KIND_GPU
-}}
-]
-input: [
-{{
-    name: \"input_ids\",
-    data_type: TYPE_INT32,
-    dims: [{max_seq_len}]
-}},
-{{
-    name: \"attention_mask\",
-    data_type: TYPE_INT32,
-    dims: [{max_seq_len}]
-}}
-]
-output: [
-{{
-    name: \"output\",
-    data_type: TYPE_FP32,
-    dims: [{labels}]
-}}
-]"""
-        )
-
 class BatchLoggerCallback(Callback):
     def __init__(self, batch_size, train_records, global_train_batch_size):
         print("Batch logger initialized")
