@@ -103,23 +103,20 @@ def tokenize_with_similarity(tokenizer, max_length, label_encoder, tax_embeds, e
 
 
 def s3_sync(s3_path: str, local_dir: str, pull=True) -> None:
+    """
+    Sync files between S3 and local directory.
+    """
     s3_path = s3_path.strip()
     local_dir = local_dir.strip()
 
     def download_dir(client, resource, prefix, start_prefix, local, bucket):
         paginator = client.get_paginator("list_objects")
         for result in paginator.paginate(Bucket=bucket, Delimiter="/", Prefix=prefix):
-            # Recurse into sub-folders
             for sub in result.get("CommonPrefixes", []):
                 download_dir(client, resource, sub["Prefix"], start_prefix, local, bucket)
-            # Download each object
             for obj in result.get("Contents", []):
                 key = obj["Key"]
-                # Compute relative path; if this is exactly the file prefix, key_relative will be empty
                 rel = key.replace(start_prefix, "").lstrip("/")
-                if not rel:
-                    # we’re downloading the single file itself
-                    rel = os.path.basename(start_prefix)
                 out_path = os.path.join(local, rel)
                 os.makedirs(os.path.dirname(out_path), exist_ok=True)
                 resource.meta.client.download_file(bucket, key, out_path)
@@ -241,6 +238,18 @@ if __name__ == "__main__":
     SAVE_TENSORRT = str(train_config.get("save_tensorrt", "true")).strip().lower() in ["true"]
     for d in [local_data_dir, local_model_dir, final_model_dir, bulk_inference_model_dir, single_inference_model_dir]:
         os.makedirs(d, exist_ok=True)
+
+    # region download pretrained and dataset via S3
+    composer.utils.dist.initialize_dist(DeviceGPU(), timeout=1000)
+    with dist.run_local_rank_zero_first():
+        # If using a pretrained S3 model, download it
+        if train_config.get("pretrained") and train_config.get("pretrained").strip():
+            pretrained_model = train_config["pretrained"].strip().rstrip("/") + "/"
+            s3_sync(s3_path=pretrained_model, local_dir=local_model_dir)
+        # Download training/validation/test data
+        if not train_config.get("skip_ds_download", False):
+            s3_sync(s3_path=train_config.get("dataset"), local_dir=local_data_dir)
+    # endregion
 
     # Download and embed taxcode descriptions if provided
     if taxcode_file:
