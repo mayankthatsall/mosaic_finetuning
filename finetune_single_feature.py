@@ -30,12 +30,14 @@ import torch
 from torch.utils.data import DataLoader
 from torchmetrics import Accuracy, F1Score
 import transformers
+from sentence_transformers import SentenceTransformer, util
 
 # Local imports
 from pysrc.inference_export import export_for_inference, get_trainer_config
+from similarity_computer import SimilarityComputer
 
 
-TRAINING_COLUMNS = ["input_ids", "attention_mask", "labels"]
+TRAINING_COLUMNS = ["input_ids", "attention_mask", "labels", "similarity_scores"]
 label_column = "taxcode"
 
 
@@ -74,7 +76,7 @@ def load_data(local_dir: str):
     return ds, label_encoder
 
 
-def tokenize_dataset(tokenizer, max_length, label_encoder, sample):
+def tokenize_dataset(tokenizer, max_length, label_encoder, sbert, tax_embeds, sample):
     src = tokenizer(
         sample[feature_column],
         padding="max_length",
@@ -83,10 +85,16 @@ def tokenize_dataset(tokenizer, max_length, label_encoder, sample):
     )
     labels = sample[label_column]
     tgt = label_encoder.transform(labels)
+    
+    # Compute similarity scores
+    text_embeds = sbert.encode(sample[feature_column], convert_to_tensor=True)
+    similarity_scores = util.pytorch_cos_sim(text_embeds, tax_embeds).cpu().numpy()
+    
     encodings = {
         "input_ids": src["input_ids"],
         "attention_mask": src["attention_mask"],
         "labels": tgt,
+        "similarity_scores": similarity_scores,
     }
     return encodings
 
@@ -354,44 +362,23 @@ if __name__ == "__main__":
     np.save(labels_path, label_encoder.classes_)
     # endregion
 
-    # Build a blank model from the config
-    model_name_or_location = (
-        local_model_dir
-        if train_config.get("pretrained", None)
-        else train_config["model"]
-    )
-    config = transformers.AutoConfig.from_pretrained(
-        model_name_or_location, num_labels=num_labels
-    )
+    # Add after loading the dataset
+    print("Loading tax code descriptions and computing embeddings...")
+    tax_df = pd.read_csv(train_config["taxcode_file"])
+    tax_codes = tax_df['Tax_Code'].tolist()
+    tax_descs = tax_df['Combined_Text'].tolist()
 
-    print(config.to_json_string())
+    # Initialize sentence transformer
+    sbert = SentenceTransformer('all-MiniLM-L6-v2')
+    # Pre-compute tax code embeddings
+    tax_embeds = sbert.encode(tax_descs, convert_to_tensor=True)
+    num_taxcodes = len(tax_codes)
 
-    print("Loading model from ", model_name_or_location)
+    # Update the model initialization
+    model = DistilBertWithSimilarity(num_labels=num_labels, num_taxcodes=num_taxcodes)
 
-    hf_model = transformers.AutoModelForSequenceClassification.from_config(config)
-
-    freeze_layers_except_last_n(hf_model, last_n_layers_to_train)
-    count_trainable_parameters(hf_model)
-
-    print("Loading tokenizer from ", model_name_or_location)
-    tokenizer = transformers.AutoTokenizer.from_pretrained(model_name_or_location)
-
-    max_len = int(train_config["maxlen"])
-    global_train_batch_size = int(train_config.get("train_batch_size", 250))
-    global_eval_batch_size = int(train_config.get("eval_batch_size", 500))
-
-    save_composer_checkpoint = str(
-        train_config.get("save_composer_checkpoint", "true")
-    ).strip().lower() in ["true"]
-    save_pytorch_bin = train_config.get("save_pytorch_bin", "true").strip().lower() in [
-        "true"
-    ]
-
-    device_train_batch_size = global_train_batch_size // dist.get_world_size()
-    device_eval_batch_size = global_eval_batch_size // dist.get_world_size()
-
-    # region prepare_datasets
-    p_tokenized = partial(tokenize_dataset, tokenizer, max_len, label_encoder)
+    # Update the tokenization call
+    p_tokenized = partial(tokenize_dataset, tokenizer, max_len, label_encoder, sbert, tax_embeds)
 
     vestigial_columns = set()
     for k, d in ds.items():
@@ -455,7 +442,7 @@ if __name__ == "__main__":
     ]
     # Package as a composer model
     composer_model = HuggingFaceModel(
-        model=hf_model, tokenizer=tokenizer, metrics=metrics, use_logits=True
+        model=model, tokenizer=tokenizer, metrics=metrics, use_logits=True
     )
     try:
         composer_model.model_inputs.remove("token_type_ids")
@@ -627,7 +614,7 @@ if __name__ == "__main__":
 
     with dist.run_local_rank_zero_first():
         if dist.get_global_rank() == 0:
-            hf_model.save_pretrained(final_model_dir)
+            model.save_pretrained(final_model_dir)
             tokenizer.save_pretrained(final_model_dir)
             print(f"pytorch model saved to {final_model_dir}")
 
