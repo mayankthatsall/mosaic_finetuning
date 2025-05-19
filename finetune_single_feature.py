@@ -36,6 +36,42 @@ from sentence_transformers import SentenceTransformer, util
 from pysrc.inference_export import export_for_inference, get_trainer_config
 
 
+class DistilBertWithSimilarity(torch.nn.Module):
+    def __init__(self, num_labels, num_taxcodes):
+        super().__init__()
+        self.distilbert = transformers.DistilBertModel.from_pretrained("distilbert-base-uncased")
+        self.pre_classifier = torch.nn.Linear(768, 768)
+        self.classifier = torch.nn.Linear(768, num_labels)
+        self.dropout = torch.nn.Dropout(0.1)
+        self.similarity_layer = torch.nn.Linear(num_taxcodes, 768)
+        
+    def forward(self, input_ids=None, attention_mask=None, similarity_scores=None, labels=None):
+        outputs = self.distilbert(input_ids=input_ids, attention_mask=attention_mask)
+        hidden_state = outputs[0]
+        pooled_output = hidden_state[:, 0]
+        pooled_output = self.pre_classifier(pooled_output)
+        pooled_output = torch.nn.ReLU()(pooled_output)
+        pooled_output = self.dropout(pooled_output)
+        
+        # Combine BERT features with similarity scores
+        similarity_features = self.similarity_layer(similarity_scores)
+        combined_features = pooled_output + similarity_features
+        
+        logits = self.classifier(combined_features)
+        
+        loss = None
+        if labels is not None:
+            loss_fct = torch.nn.CrossEntropyLoss()
+            loss = loss_fct(logits.view(-1, num_labels), labels.view(-1))
+            
+        return transformers.modeling_outputs.SequenceClassifierOutput(
+            loss=loss,
+            logits=logits,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+
 TRAINING_COLUMNS = ["input_ids", "attention_mask", "labels", "similarity_scores"]
 label_column = "taxcode"
 
