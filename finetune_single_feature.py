@@ -11,14 +11,13 @@ import time
 # Third-party imports
 import boto3
 import composer
-from composer import Callback, Event, Logger, State, Trainer, ComposerModel
+from composer import Callback, Event, Logger, State, Trainer
 from composer.devices import DeviceGPU
 from composer.metrics import CrossEntropy
 from composer.models.huggingface import HuggingFaceModel
 from composer.optim import DecoupledAdamW
 from composer.utils import dist, get_device
 from datasets import load_dataset, Features, Value
-import mlflow
 import numpy as np
 import pandas as pd
 from sklearn.metrics import classification_report
@@ -29,282 +28,155 @@ from torch.utils.data import DataLoader
 from torchmetrics import Accuracy, F1Score
 import transformers
 from sentence_transformers import SentenceTransformer, util
-from torch.utils.data.distributed import DistributedSampler
-import torch.distributed as dist
-from composer.core import DataSpec
 
 # Local imports
 from pysrc.inference_export import export_for_inference, get_trainer_config
 
-
-mlflow.set_tracking_uri("https://hercule-mlflow.gamma.qa.us-west-2.aws.avalara.io/")
-
-TRAINING_COLUMNS = ["input_ids", "attention_mask", "labels", "similarity_scores"]
-# label_column = "taxcode"
-label_column = "label"
-feature_column = "input"
+# Columns for training, now including similarity vector
+TRAINING_COLUMNS = ["input_ids", "attention_mask", "sims", "labels"]
+label_column = "taxcode"
 
 
-def compute_similarity_scores(input_texts, taxcode_descriptions, model_name='all-MiniLM-L6-v2'):
-    """Compute similarity scores between input texts and taxcode descriptions."""
-    sbert = SentenceTransformer(model_name)
-    # Embed taxcode descriptions once
-    tax_embeds = sbert.encode(taxcode_descriptions, convert_to_tensor=True)
-    # Embed all input texts
-    input_embeds = sbert.encode(input_texts, convert_to_tensor=True)
-    # Compute cosine similarity matrix
-    sim_matrix = util.pytorch_cos_sim(input_embeds, tax_embeds).cpu().numpy()
-    return sim_matrix
-
-
-def load_data(local_dir: str, taxcode_file: str = None):
+def load_data(local_dir: str):
+    """
+    Load datasets from local_dir under train/, validation/, test/ as TSVs,
+    return a DatasetDict and a fitted LabelEncoder on taxcode.
+    """
     dfs = {}
-    for s in ["train", "test", "validation"]:
-        lp = f"{local_dir.rstrip('/')}/{s}"
-        if os.path.exists(lp) and len(os.listdir(lp)) > 0:
-            # print(f"{lp} exists. loading dataset")
-            dfs[s] = f"{local_dir.rstrip('/')}/{s}/*.csv"
+    for split in ["train", "validation", "test"]:
+        path = os.path.join(local_dir, split)
+        if os.path.exists(path) and os.listdir(path):
+            dfs[split] = f"{path}/*.tsv"
 
-    features = Features(
-        {
-            feature_column: Value(dtype="string", id=None),
-            label_column: Value(dtype="string", id=None),
-        }
-    )
-    ds = load_dataset("csv", data_files=dfs, features=features)
+    features = Features({
+        "sentence1": Value("string"),
+        "company_name": Value("string"),
+        "sentence2": Value("string"),
+        "category": Value("string"),
+        "taxcode": Value("string"),
+        "source": Value("string"),
+    })
+    ds = load_dataset("csv", data_files=dfs, delimiter="\t", features=features)
 
+    # Collect all labels and fit encoder
     all_labels = set()
-    for k, vds in ds.items():
-        for l in vds[label_column]:
-            all_labels.add(l)
+    for split_ds in ds.values():
+        all_labels.update(split_ds[label_column])
 
     label_encoder = LabelEncoder()
-    label_encoder.fit_transform(list(all_labels))
+    label_encoder.fit(list(all_labels))
 
-    print(
-        f"\nFound following datasets under {local_dir} \n{json.dumps(dfs)}\n{len(label_encoder.classes_)} labels fit"
-    )
-
-    # Load taxcode descriptions if provided
-    taxcode_descriptions = None
-    if taxcode_file and os.path.exists(taxcode_file):
-        tax_df = pd.read_csv(taxcode_file)
-        taxcode_descriptions = tax_df['Combined_Text'].tolist()
-        print(f"Loaded {len(taxcode_descriptions)} taxcode descriptions")
-
-    return ds, label_encoder, taxcode_descriptions
+    print(f"Found datasets under {local_dir}: {dfs}, {len(label_encoder.classes_)} labels")
+    return ds, label_encoder
 
 
-def tokenize_dataset(sample, tokenizer, label_encoder, label_column, maxlen, taxcode_descriptions=None):
-    """Tokenize a single example from the dataset."""
-    # Tokenize the text
-    tokenized = tokenizer(
-        sample[feature_column],
+def tokenize_with_similarity(tokenizer, max_length, label_encoder, tax_embeds, embedder, samples):
+    """
+    tokenizer + similarity vector computation for a batch of samples.
+    """
+    texts = samples["sentence1"]
+    labels = samples[label_column]
+    # Batch tokenize
+    enc = tokenizer(
+        texts,
         padding="max_length",
-        max_length=maxlen,
         truncation=True,
+        max_length=max_length,
     )
-    
-    # Handle labels - ensure it's a list/array
-    labels = sample[label_column]
-    if not isinstance(labels, (list, np.ndarray)):
-        labels = [labels]
-    
-    # Transform labels to numeric values
-    try:
-        tgt = label_encoder.transform(labels)
-    except ValueError as e:
-        print(f"Warning: Invalid label found: {labels}")
-        # Return a default value or skip this example
-        return None
 
-    # Compute similarity scores if taxcode descriptions are available
-    similarity_scores = None
-    if taxcode_descriptions is not None:
-        # Get the taxcode description for this example
-        taxcode_desc = taxcode_descriptions.get(sample[label_column], "")
-        if taxcode_desc:
-            # Compute similarity between the text and taxcode description
-            similarity_scores = compute_similarity_scores([sample[feature_column]], [taxcode_desc])[0][0][0]
+    # Compute similarities batch-wise if embeddings provided
+    if tax_embeds is not None and embedder is not None:
+        text_embs = embedder.encode(texts, convert_to_tensor=True)
+        sim_matrix = util.pytorch_cos_sim(text_embs, tax_embeds).cpu().numpy()
+    else:
+        sim_matrix = np.zeros((len(texts), len(label_encoder.classes_)), dtype=np.float32)
 
-    # Combine all features
-    result = {
-        **tokenized,
+    # Transform labels
+    tgt = label_encoder.transform(labels)
+
+    return {
+        "input_ids": enc["input_ids"],
+        "attention_mask": enc["attention_mask"],
+        "sims": sim_matrix.tolist(),
         "labels": tgt,
     }
-    
-    if similarity_scores is not None:
-        result["similarity_scores"] = similarity_scores
-        
-    return result
 
 
 def s3_sync(s3_path: str, local_dir: str, pull=True) -> None:
-    # import os
-    # cmd = 'aws s3 sync s3://source-bucket/ my-dir'
-    # os.system(cmd)
-    # if we have aws cli installed
-    #
+    """
+    Sync files between S3 and local directory.
+    """
     s3_path = s3_path.strip()
     local_dir = local_dir.strip()
 
-    # region aws s3 sync implementation
     def download_dir(client, resource, prefix, start_prefix, local, bucket):
         paginator = client.get_paginator("list_objects")
         for result in paginator.paginate(Bucket=bucket, Delimiter="/", Prefix=prefix):
-            if result.get("CommonPrefixes") is not None:
-                for subdir in result.get("CommonPrefixes"):
-                    download_dir(
-                        client,
-                        resource,
-                        subdir.get("Prefix"),
-                        start_prefix,
-                        local,
-                        bucket,
-                    )
-            if result.get("Contents") is not None:
-                for file in result.get("Contents"):
-                    # local + os.sep + key_relative
-                    key_relative = file.get("Key").replace(start_prefix, "")
-                    local_path = os.path.join(local, key_relative.lstrip("/"))
-                    local_dir = "/".join(local_path.split("/")[:-1])
+            for sub in result.get("CommonPrefixes", []):
+                download_dir(client, resource, sub["Prefix"], start_prefix, local, bucket)
+            for obj in result.get("Contents", []):
+                key = obj["Key"]
+                rel = key.replace(start_prefix, "").lstrip("/")
+                out_path = os.path.join(local, rel)
+                os.makedirs(os.path.dirname(out_path), exist_ok=True)
+                resource.meta.client.download_file(bucket, key, out_path)
 
-                    if not os.path.exists(local_dir):
-                        os.makedirs(local_dir, exist_ok=True)
-
-                    s3_path = file.get("Key")
-                    print(f"Downloading {s3_path} -> {local_path}")
-                    resource.meta.client.download_file(bucket, s3_path, local_path)
-
-    def pull_s3_prefix(dst_dir, bucket, prefix):
+    def pull_prefix(dst, bucket, prefix):
         client = boto3.client("s3")
         resource = boto3.resource("s3")
-        download_dir(client, resource, prefix, prefix, dst_dir, bucket)
+        download_dir(client, resource, prefix, prefix, dst, bucket)
 
-    def upload_dir_s3(source_dir, bucket, prefix=""):
+    def upload_dir(source, bucket, prefix=""):
         client = boto3.client("s3")
-        # enumerate local files recursively
-        for root, dirs, files in os.walk(source_dir):
-            for filename in files:
-                # construct the full local path
-                local_path = os.path.join(root, filename)
-                relative_path = os.path.relpath(local_path, source_dir)
-                s3_path = os.path.join(prefix, relative_path)
-                try:
-                    print("Uploading %s..." % s3_path)
-                    client.upload_file(local_path, bucket, s3_path)
-                except Exception as e:
-                    print(f"Failed to upload {local_path} to {s3_path}")
+        for root, _, files in os.walk(source):
+            for f in files:
+                local_path = os.path.join(root, f)
+                rel = os.path.relpath(local_path, source)
+                key = os.path.join(prefix, rel)
+                client.upload_file(local_path, bucket, key)
 
-    def push_to_s3(local_dir, bucket, prefix):
-        upload_dir_s3(source_dir=local_dir, bucket=bucket, prefix=prefix)
-
-    # endregion
-
-    paths = s3_path.split(":")[1].lstrip("//").split("/")
-    bucket = paths[0]
-    prefix = "/".join(paths[1:])
-    print(f"bucket [{bucket}] prefix [{prefix}] local [{local_dir}]")
+    parts = s3_path.replace("s3://", "").split("/", 1)
+    bucket = parts[0]
+    prefix = parts[1] if len(parts) > 1 else ""
     if pull:
-        pull_s3_prefix(dst_dir=local_dir, bucket=bucket, prefix=prefix)
+        pull_prefix(local_dir, bucket, prefix)
     else:
-        push_to_s3(local_dir=local_dir, bucket=bucket, prefix=prefix)
-    #
+        upload_dir(local_dir, bucket, prefix)
 
 
 def create_and_save_pbtxt(model_name, save_path, max_seq_len, labels):
-    if model_name is None:
-        model_name = "default_model"
-    with open(save_path + "config.pbtxt", "w") as f:
+    save_path = f"{'/'.join(save_path.split('/')[:-2])}/config.pbtxt"
+    with open(save_path, "w") as f:
         f.write(
-            f"""name: "{model_name}"
-            backend: "tensorrt"
-            max_batch_size: {32 if "bulk" in save_path else 8}
-            instance_group [
-            {{
-                count: 1
-                kind: KIND_GPU
-            }}
-            ]
-            input: [
-            {{
-                name: "input_ids",
-                data_type: TYPE_INT32,
-                dims: [{max_seq_len}]
-            }},
-            {{
-                name: "attention_mask",
-                data_type: TYPE_INT32,
-                dims: [{max_seq_len}]
-            }}
-            ]
-            output: [
-            {{
-                name: "output",
-                data_type: TYPE_FP32,
-                dims: [{labels}]
-            }}
-            ]"""
+            f"""name: {model_name}
+backend: \"tensorrt\"
+max_batch_size: {32 if 'bulk' in save_path else 12}
+instance_group [
+{{
+    count: 1
+    kind: KIND_GPU
+}}
+]
+input: [
+{{
+    name: \"input_ids\",
+    data_type: TYPE_INT32,
+    dims: [{max_seq_len}]
+}},
+{{
+    name: \"attention_mask\",
+    data_type: TYPE_INT32,
+    dims: [{max_seq_len}]
+}}
+]
+output: [
+{{
+    name: \"output\",
+    data_type: TYPE_FP32,
+    dims: [{labels}]
+}}
+]"""
         )
-
-
-def freeze_layers_except_last_n(model, n_layers):
-    # First freeze everything
-    for param in model.parameters():
-        param.requires_grad = False
-    layers_to_train = 0
-
-    # For BERT-like models
-    if hasattr(model, "bert"):
-        # Unfreeze the last n transformer layers
-        for layer in model.bert.encoder.layer[-n_layers:]:
-            for param in layer.parameters():
-                param.requires_grad = True
-                layers_to_train += 1
-
-    # For RoBERTa-like models
-    elif hasattr(model, "roberta"):
-        # Unfreeze the last n transformer layers
-        for layer in model.roberta.encoder.layer[-n_layers:]:
-            for param in layer.parameters():
-                param.requires_grad = True
-                layers_to_train += 1
-
-    elif hasattr(model, "distilbert"):  # distilbert
-        # Unfreeze the last n transformer layers
-        for layer in model.distilbert.transformer.layer[-n_layers:]:
-            for param in layer.parameters():
-                param.requires_grad = True
-                layers_to_train += 1
-
-    elif hasattr(model, "model"):  # modernbert
-        # Unfreeze the last n transformer layers
-        for layer in model.model.layers[-n_layers:]:
-            for param in layer.parameters():
-                param.requires_grad = True
-                layers_to_train += 1
-
-    print(f"Last n trainable layers: {layers_to_train}")
-
-    # Always unfreeze the classification head
-    if hasattr(model, "classifier"):
-        for param in model.classifier.parameters():
-            param.requires_grad = True
-
-
-# Print trainable parameters to verify
-def count_trainable_parameters(model):
-    trainable_params = 0
-    all_param = 0
-    for param in model.parameters():
-        all_param += param.numel()
-        if param.requires_grad:
-            trainable_params += param.numel()
-    print(
-        f"trainable params: {trainable_params:,d} || all params: {all_param:,d} "
-        f"|| trainable%: {100 * trainable_params / all_param:.2f}"
-    )
-
 
 class BatchLoggerCallback(Callback):
     def __init__(self, batch_size, train_records, global_train_batch_size):
@@ -327,10 +199,8 @@ class BatchLoggerCallback(Callback):
                 self.st = time.time()
             self.batch_count += 1
             self.total += 1
-
         if event == Event.EPOCH_START:
             self.epoch_st = time.time()
-
         if event == Event.EPOCH_END:
             self.epoch_nd = time.time()
             print(
@@ -338,243 +208,257 @@ class BatchLoggerCallback(Callback):
             )
             self.epoch += 1
             self.epoch_st = time.time()
-
-        if event == Event.BATCH_END:
-            if self.batch_count >= self.log_interval:
-                self.nd = time.time()
-                print(
-                    f"{(self.nd - self.st):0.2f}s / {self.log_interval} batches Done - {self.total} epoch {self.epoch} -  loss {state.loss}"
-                )
-                self.batch_count = 0
-
-
-class DistilBertWithSimilarity(torch.nn.Module):
-    def __init__(self, num_labels, num_taxcodes, model_name='distilbert-base-uncased'):
-        super().__init__()
-        self.bert = transformers.DistilBertModel.from_pretrained(model_name)
-        hidden_size = self.bert.config.hidden_size
-        self.dropout = torch.nn.Dropout(0.1)
-        # classifier accepts [CLS] embedding + similarity vector
-        self.classifier = torch.nn.Linear(hidden_size + num_taxcodes, num_labels)
-
-    def forward(self, input_ids, attention_mask, similarity_scores=None, labels=None):
-        outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
-        cls_embed = outputs.last_hidden_state[:, 0]  # [CLS]
-        x = self.dropout(cls_embed)
-        
-        if similarity_scores is not None:
-            x = torch.cat([x, similarity_scores], dim=1)
-        
-        logits = self.classifier(x)
-        loss = None
-        if labels is not None:
-            loss_fn = torch.nn.CrossEntropyLoss()
-            loss = loss_fn(logits, labels)
-        return {'loss': loss, 'logits': logits}
-
-
-def create_model(train_config, num_labels, num_taxcodes=None):
-    model_name = train_config.get("model", "distilbert-base-uncased")
-    
-    if num_taxcodes is not None:
-        # Use custom model with similarity scores
-        model = DistilBertWithSimilarity(
-            num_labels=num_labels,
-            num_taxcodes=num_taxcodes,
-            model_name=model_name
-        )
-    else:
-        # Use standard HuggingFace model
-        model = transformers.DistilBertForSequenceClassification.from_pretrained(
-            model_name,
-            num_labels=num_labels
-        )
-    
-    return model
-
-
-class DistilBertComposerModel(ComposerModel):
-    def __init__(self, model):
-        super().__init__()
-        self.model = model
-
-    def forward(self, batch):
-        return self.model(**batch)
-
-    def loss(self, outputs, batch):
-        return outputs['loss']
-
-    def eval_forward(self, batch, outputs=None):
-        if outputs is None:
-            outputs = self.forward(batch)
-        return outputs
-
-    def get_metrics(self, is_train=False):
-        return {}
-
-
-class CustomDataSpec(DataSpec):
-    def __init__(self, dataloader):
-        super().__init__(dataloader)
-        
-    def get_num_samples_in_batch(self, batch):
-        # Get the size of the first tensor (input_ids)
-        return batch['input_ids'].size(0)
-        
-    def batch_transforms(self, batch):
-        # Convert batch to tensors and move to device
-        return {
-            'input_ids': batch['input_ids'],
-            'attention_mask': batch['attention_mask'],
-            'labels': batch['labels'],
-            'similarity_scores': batch.get('similarity_scores', None)
-        }
-
+        if event == Event.BATCH_END and self.batch_count >= self.log_interval:
+            nd = time.time()
+            print(
+                f"{(nd - self.st):0.2f}s / {self.log_interval} batches Done - {self.total} epoch {self.epoch} -  loss {state.loss}"
+            )
+            self.batch_count = 0
 
 if __name__ == "__main__":
-    # region prepare config
+    # Load config
     train_config = get_trainer_config()
-    print(f"train_config: {train_config}")
+    if train_config["dataset"] is None:
+        raise Exception("dataset path mandatory")
 
-    # region prepare paths
-    local_data_dir = train_config.get("dataset", None)
-    if local_data_dir.startswith("s3://"):
-        local_data_dir = "/tmp/data"
-        s3_sync(train_config.get("dataset"), local_data_dir, pull=True)
+    # New args
+    taxcode_file = train_config.get("taxcode_file")
+    sim_model = train_config.get("similarity_model", "all-MiniLM-L6-v2")
 
-    local_model_dir = train_config.get("s3_out_dest", None)
-    if local_model_dir.startswith("s3://"):
-        local_model_dir = "/tmp/model"
-        os.makedirs(local_model_dir, exist_ok=True)
+    # Prepare dirs
+    w = train_config["workdir"].rstrip("/")
+    local_data_dir = f"{w}/data/"
+    local_model_dir = f"{w}/model/"
+    checkpoint_dir = f"{w}/checkpoint/"
+    final_model_dir = f"{w}/final_model/"
+    MODEL_CATEGORY_NAME = str(train_config.get("model_category_name", "")).strip().lower()
+    bulk_inference_model_dir = f"{final_model_dir}bulk_inference/models/repository/{MODEL_CATEGORY_NAME}/1/"
+    single_inference_model_dir = f"{final_model_dir}single_inference/models/repository/{MODEL_CATEGORY_NAME}/1/"
+    labels_path = f"{final_model_dir.rstrip('/')}/classes.npy"
+    SAVE_TENSORRT = str(train_config.get("save_tensorrt", "true")).strip().lower() in ["true"]
+    for d in [local_data_dir, local_model_dir, final_model_dir, bulk_inference_model_dir, single_inference_model_dir]:
+        os.makedirs(d, exist_ok=True)
 
-    labels_path = os.path.join(local_model_dir, "classes.npy")
-    # endregion
+    # Download and embed taxcode descriptions if provided
+    if taxcode_file:
+        s3_sync(s3_path=taxcode_file, local_dir=local_data_dir)
+        tax_df = pd.read_csv(os.path.join(local_data_dir, os.path.basename(taxcode_file)))
+        tax_descs = tax_df["Combined_Text"].tolist()
+        embedder = SentenceTransformer(sim_model)
+        tax_embeds = embedder.encode(tax_descs, convert_to_tensor=True)
+    else:
+        embedder = None
+        tax_embeds = None
 
-    # region prepare label encoder
-    ds, label_encoder, taxcode_descriptions = load_data(
-        local_dir=local_data_dir,
-        taxcode_file=train_config.get("taxcode_file", None)
-    )
+    # Load data and encoder
+    ds, label_encoder = load_data(local_data_dir)
     num_labels = len(label_encoder.classes_)
     np.save(labels_path, label_encoder.classes_)
-    # endregion
 
-    # region prepare tokenizer
-    tokenizer = transformers.DistilBertTokenizerFast.from_pretrained(
-        train_config.get("model", "distilbert-base-uncased")
+    # Load model and tokenizer
+    model_source = local_model_dir if train_config.get("pretrained") else train_config["model"]
+    config = transformers.AutoConfig.from_pretrained(model_source, num_labels=num_labels)
+    hf_model = transformers.AutoModelForSequenceClassification.from_config(config)
+    tokenizer = transformers.AutoTokenizer.from_pretrained(model_source)
+    max_len = int(train_config.get("maxlen", 256))
+    global_train_batch_size = int(train_config.get("train_batch_size", 250))
+    global_eval_batch_size = int(train_config.get("eval_batch_size", 500))
+
+    # Tokenize and map
+    TRAINING_COLUMNS[:] = ["input_ids", "attention_mask", "sims", "labels"]
+    map_fn = partial(tokenize_with_similarity, tokenizer, max_len, label_encoder, tax_embeds, embedder)
+    vest_cols = set()
+    for split_ds in ds.values():
+        vest_cols.update(c for c in split_ds.column_names if c not in TRAINING_COLUMNS)
+    tokenized = ds.map(function=map_fn, batched=True, num_proc=cpu_count(), remove_columns=list(vest_cols))
+    for split_ds in tokenized.values():
+        split_ds.set_format(type="torch", columns=TRAINING_COLUMNS)
+    data_collator = transformers.data.data_collator.default_data_collator
+
+    train_dataset = tokenized["train"]
+    train_dataloader = DataLoader(dataset=train_dataset,
+                                  batch_size=global_train_batch_size // dist.get_world_size(),
+                                  sampler=dist.get_sampler(train_dataset, shuffle=True, drop_last=False),
+                                  collate_fn=data_collator)
+
+    validation_dataloader = DataLoader(dataset=tokenized.get("validation",[]),
+                                       batch_size=global_eval_batch_size // dist.get_world_size(),
+                                       sampler=dist.get_sampler(tokenized.get("validation",[]), shuffle=False, drop_last=False),
+                                       collate_fn=data_collator)
+
+    test_dataloader = DataLoader(dataset=tokenized.get("test",[]),
+                                 batch_size=global_eval_batch_size,
+                                 shuffle=False,
+                                 drop_last=False,
+                                 collate_fn=data_collator)
+
+    print(f"Datasets tokenized and loaded: train={len(train_dataset)}, val={len(tokenized.get('validation',[]))}, test={len(tokenized.get('test',[]))}")
+
+    # Metrics
+    metrics = [CrossEntropy(), Accuracy(task="multiclass", num_classes=num_labels), F1Score(task="multiclass", num_classes=num_labels)]
+
+    # Wrap HF model to consume similarity vector
+    class HFWithSimilarity(HuggingFaceModel):
+        def __init__(self, model, tokenizer, metrics, num_labels):
+            super().__init__(model=model, tokenizer=tokenizer, metrics=metrics, use_logits=True)
+            hidden = model.config.hidden_size
+            self.head = torch.nn.Linear(hidden + num_labels, num_labels)
+            self.num_labels = num_labels
+
+        def forward(self, input_ids, attention_mask, sims=None, labels=None):
+            out = self.model(input_ids=input_ids, attention_mask=attention_mask)
+            cls_emb = out.last_hidden_state[:,0]
+            x = torch.cat([cls_emb, sims], dim=-1) if sims is not None else cls_emb
+            logits = self.head(x)
+            loss = torch.nn.functional.cross_entropy(logits, labels) if labels is not None else None
+            return {"loss": loss, "logits": logits}
+
+    composer_model = HFWithSimilarity(hf_model, tokenizer, metrics, num_labels)
+    try:
+        composer_model.model_inputs.remove("token_type_ids")
+    except:
+        pass
+
+    # Load pretrained weights if requested
+    if train_config.get("load_as_weights", False):
+        state_dict = torch.load(os.path.join(local_model_dir, "pytorch_model.bin"))
+        missing, unexpected = composer_model.load_state_dict(state_dict, strict=False)
+        if missing: print("MISSING KEYS", missing)
+        if unexpected: print("UNEXPECTED KEYS", unexpected)
+
+    # Optimizer & scheduler
+    adam_cfg = train_config["optimizer"]["adam"]
+    optimizer = DecoupledAdamW(params=composer_model.parameters(),
+                               lr=float(adam_cfg["lr"]),
+                               betas=(float(adam_cfg["betas"][0]), float(adam_cfg["betas"][1])),
+                               eps=float(adam_cfg["eps"]),
+                               weight_decay=float(adam_cfg["weight_decay"]))
+
+    sched_cfg = train_config["scheduler"]["linear_scheduler"]
+    linear_lr_decay = composer.optim.scheduler.LinearScheduler(
+        alpha_i=float(sched_cfg["alpha_i"]), alpha_f=float(sched_cfg["alpha_f"]), t_max=sched_cfg["t_max"]
     )
-    max_len = train_config.get("maxlen", 256)
-    # endregion
 
-    # region prepare_datasets
-    vestigial_columns = set()
-    for k, vds in ds.items():
-        vestigial_columns.update(vds.column_names)
-    vestigial_columns = vestigial_columns - set(TRAINING_COLUMNS)
-
-    ds = ds.map(
-        lambda x: tokenize_dataset(
-            sample=x,
-            tokenizer=tokenizer,
-            label_encoder=label_encoder,
-            label_column=label_column,
-            maxlen=max_len,
-            taxcode_descriptions=taxcode_descriptions
-        ),
-        batched=False,
-        remove_columns=vestigial_columns,
-        desc="Tokenizing dataset",
-    ).filter(
-        lambda x: x is not None,  # Remove any None values
-        desc="Filtering invalid examples"
-    )
-    # endregion
-
-    # region prepare model
-    num_taxcodes = len(taxcode_descriptions) if taxcode_descriptions else None
-    base_model = create_model(train_config, num_labels, num_taxcodes)
-    model = DistilBertComposerModel(base_model)
-
-    # Add optimizer configuration
-    optimizer = DecoupledAdamW(
-        model.parameters(),
-        lr=float(train_config['optimizer']['adam']['lr']),
-        betas=tuple(train_config['optimizer']['adam']['betas']),
-        eps=float(train_config['optimizer']['adam']['eps']),
-        weight_decay=train_config['optimizer']['adam']['weight_decay']
-    )
-    # endregion
-
-    # region prepare trainer
-    # Initialize distributed process group
-    if not dist.is_initialized():
-        dist.init_process_group(backend='nccl')
-
-    # Get local rank from environment variable
-    local_rank = int(os.environ.get('LOCAL_RANK', 0))
-    torch.cuda.set_device(local_rank)
-
-    # Set tokenizer parallelism to false to avoid warnings
-    os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
-    train_sampler = DistributedSampler(ds["train"])
-    val_sampler = DistributedSampler(ds["validation"], shuffle=False)
-
-    train_dataloader = DataLoader(
-        ds["train"],
-        batch_size=train_config.get("train_batch_size", 128),
-        sampler=train_sampler,
-        num_workers=4,
-        pin_memory=True,
-    )
-
-    eval_dataloader = DataLoader(
-        ds["validation"],
-        batch_size=train_config.get("eval_batch_size", 128),
-        sampler=val_sampler,
-        num_workers=4,
-        pin_memory=True,
-    )
-
+    # Trainer
     trainer = Trainer(
-        model=model,
-        train_dataloader=CustomDataSpec(train_dataloader),
-        eval_dataloader=CustomDataSpec(eval_dataloader),
-        max_duration=train_config.get("max_duration", "5ep"),
-        device=DeviceGPU(),
-        optimizers=optimizer,
-        callbacks=[
-            BatchLoggerCallback(
-                batch_size=train_config.get("train_batch_size", 128),
-                train_records=len(ds["train"]),
-                global_train_batch_size=train_config.get("train_batch_size", 128)
-                * train_config.get("grad_accum", 1),
-            )
-        ],
-    )
-    # endregion
-
-    # region train
-    trainer.fit()
-    # endregion
-
-    # region save model
-    model.save_pretrained(local_model_dir)
-    tokenizer.save_pretrained(local_model_dir)
-    # endregion
-
-    # region export for inference
-    if train_config.get("save_tensorrt", False):
-        export_for_inference(
-            model_dir=local_model_dir,
-            bulk_s3_out_dest=train_config.get("bulk_s3_out_dest", None),
-            single_s3_out_dest=train_config.get("single_s3_out_dest", None),
-            max_seq_len=max_len,
-            labels=label_encoder.classes_,
+    model=composer_model,
+    run_name=os.environ.get("RUN_NAME"),
+    train_dataloader=train_dataloader,
+    eval_dataloader=validation_dataloader,
+    max_duration=train_config.get("max_duration", "1ep"),
+    optimizers=optimizer,
+    schedulers=[linear_lr_decay],
+    callbacks=[
+        BatchLoggerCallback(
+            batch_size=train_config.get("log_every_x_batches", 1000),
+            train_records=len(train_dataset),
+            global_train_batch_size=global_train_batch_size,
         )
-    # endregion
+    ],
+    loggers=[],
+    algorithms=train_config.get("algorithms", []),
+    device="gpu" if torch.cuda.is_available() else "cpu",
+    precision=train_config.get("precision", "fp32"),
+    seed=17,
+    save_folder=checkpoint_dir,
+    save_weights_only=True,
+    save_overwrite=True,
+    save_interval=train_config.get("save_interval", "1ep"),
+    progress_bar=train_config.get("progress_bar", False),
+    log_to_console=train_config.get("log_to_console", False),
+)
 
-    # region upload to s3
-    if train_config.get("s3_out_dest", None).startswith("s3://"):
-        s3_sync(train_config.get("s3_out_dest"), local_model_dir, pull=False)
-    # endregion
+# Training
+print("Starting training...")
+trainer.fit()
+print("Training complete.")
+
+# Save final model
+with dist.run_local_rank_zero_first():
+    if dist.get_global_rank() == 0:
+        hf_model.save_pretrained(final_model_dir)
+        tokenizer.save_pretrained(final_model_dir)
+
+# Prediction loop
+print("Running predictions on test set...")
+trainer.state.model.eval()
+y_true, y_pred, final_res = [], [], []
+with torch.no_grad():
+    _device = get_device("gpu" if torch.cuda.is_available() else "cpu")
+    for batch in test_dataloader:
+        batch = _device.batch_to_device(batch)
+        y_true.extend(batch["labels"].cpu().numpy())
+        out = trainer.state.model(batch)
+        logits = out["logits"].cpu()
+        probs, ix = torch.topk(torch.nn.functional.softmax(logits, dim=-1), k=3, dim=-1)
+        preds = ix.numpy()
+        scores = probs.numpy()
+        for p, s in zip(preds, scores):
+            final_res.append(list(zip(p.tolist(), s.tolist())))
+        y_pred.extend(np.argmax(logits.numpy(), axis=1).tolist())
+
+# Build results DataFrame
+res_df = pd.DataFrame(ds.get("test", []))
+if not res_df.empty:
+    res_df["y_true"] = label_encoder.inverse_transform(y_true)
+    res_df["y_pred"] = label_encoder.inverse_transform(y_pred)
+    ff = pd.DataFrame(final_res, columns=["res_1", "res_2", "res_3"])
+    f1 = pd.DataFrame(ff["res_1"].tolist(), columns=["pred_1", "score_1"])
+    f2 = pd.DataFrame(ff["res_2"].tolist(), columns=["pred_2", "score_2"])
+    f3 = pd.DataFrame(ff["res_3"].tolist(), columns=["pred_3", "score_3"])
+    final_df = pd.concat([res_df, f1, f2, f3], axis=1)
+    final_df.to_csv(
+        os.path.join(final_model_dir, "predictions.tsv"),
+        sep="	",
+        index=False,
+    )
+
+# Classification report
+json_cr = classification_report(
+    y_true=label_encoder.inverse_transform(y_true),
+    y_pred=label_encoder.inverse_transform(y_pred),
+    labels=label_encoder.classes_,
+    output_dict=True,
+    target_names=list(label_encoder.classes_),
+    zero_division=0,
+)
+with open(os.path.join(final_model_dir, "cr.json"), "w") as w:
+    json.dump(json_cr, w, indent=2)
+print("Results and report saved.")
+
+# ONNX/TensorRT export
+if SAVE_TENSORRT:
+    with dist.run_local_rank_zero_first():
+        if dist.get_global_rank() == 0:
+            sample_batch = {k: v.cpu() for k, v in next(iter(test_dataloader)).items() if k != "labels"}
+            export_for_inference(
+                model=composer_model,
+                save_format="tensorrt",
+                save_path=bulk_inference_model_dir,
+                sample_input=(sample_batch, {}),
+                dynamic_axes={
+                    "input_ids": {0: "batch", 1: "seq"},
+                    "attention_mask": {0: "batch", 1: "seq"},
+                    "output": {0: "batch"},
+                },
+            )
+            create_and_save_pbtxt(MODEL_CATEGORY_NAME, bulk_inference_model_dir, max_len, num_labels)
+            export_for_inference(
+                model=composer_model,
+                save_format="tensorrt",
+                save_path=single_inference_model_dir,
+                sample_input=(sample_batch, {}),
+                dynamic_axes={
+                    "input_ids": {0: "batch", 1: "seq"},
+                    "attention_mask": {0: "batch", 1: "seq"},
+                    "output": {0: "batch"},
+                },
+            )
+            create_and_save_pbtxt(MODEL_CATEGORY_NAME, single_inference_model_dir, max_len, num_labels)
+else:
+    print("Skipping ONNX/TensorRT export")
+
+# Final S3 upload
+with dist.run_local_rank_zero_first():
+    if dist.get_global_rank() == 0 and train_config.get("s3_out_dest"):
+        s3_sync(s3_path=train_config["s3_out_dest"], local_dir=final_model_dir, pull=False)
