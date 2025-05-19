@@ -34,7 +34,6 @@ from sentence_transformers import SentenceTransformer, util
 
 # Local imports
 from pysrc.inference_export import export_for_inference, get_trainer_config
-from similarity_computer import SimilarityComputer
 
 
 TRAINING_COLUMNS = ["input_ids", "attention_mask", "labels", "similarity_scores"]
