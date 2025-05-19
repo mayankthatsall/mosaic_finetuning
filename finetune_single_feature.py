@@ -12,7 +12,10 @@ import time
 import boto3
 import composer
 from composer import Callback, Event, Logger, State, Trainer
+from composer.algorithms import GradientClipping, SelectiveBackprop
+from composer.callbacks import EarlyStopper, SpeedMonitor, LRMonitor
 from composer.devices import DeviceGPU
+from composer.loggers import ConsoleLogger
 from composer.metrics import CrossEntropy
 from composer.models.huggingface import HuggingFaceModel
 from composer.optim import DecoupledAdamW
@@ -36,25 +39,25 @@ TRAINING_COLUMNS = ["input_ids", "attention_mask", "labels"]
 label_column = "taxcode"
 
 
+label_column = "label"
+feature_column = "input"
+
+
 def load_data(local_dir: str):
     dfs = {}
     for s in ["train", "test", "validation"]:
         lp = f"{local_dir.rstrip('/')}/{s}"
         if os.path.exists(lp) and len(os.listdir(lp)) > 0:
             # print(f"{lp} exists. loading dataset")
-            dfs[s] = f"{local_dir.rstrip('/')}/{s}/*.tsv"
+            dfs[s] = f"{local_dir.rstrip('/')}/{s}/*.csv"
 
     features = Features(
         {
-            "sentence1": Value(dtype="string", id=None),
-            "company_name": Value(dtype="string", id=None),
-            "sentence2": Value(dtype="string", id=None),
-            "category": Value(dtype="string", id=None),
-            "taxcode": Value(dtype="string", id=None),
-            "source": Value(dtype="string", id=None),
+            feature_column: Value(dtype="string", id=None),
+            label_column: Value(dtype="string", id=None),
         }
     )
-    ds = load_dataset("csv", data_files=dfs, delimiter="\t", features=features)
+    ds = load_dataset("csv", data_files=dfs, features=features)
 
     all_labels = set()
     for k, vds in ds.items():
@@ -73,7 +76,7 @@ def load_data(local_dir: str):
 
 def tokenize_dataset(tokenizer, max_length, label_encoder, sample):
     src = tokenizer(
-        sample["sentence1"],
+        sample[feature_column],
         padding="max_length",
         max_length=max_length,
         truncation=True,
@@ -196,46 +199,97 @@ def create_and_save_pbtxt(model_name, save_path, max_seq_len, labels):
         )
 
 
-class BatchLoggerCallback(Callback):
-    def __init__(self, batch_size, train_records, global_train_batch_size):
-        print("Batch logger initialized")
-        self.log_interval = batch_size
-        self.st = time.time()
-        self.batch_count = 0
-        self.train_records = train_records
-        self.global_train_batch_size = global_train_batch_size
-        self.total = 0
-        self.epoch = 0
-        self.epoch_st = time.time()
-        self.epoch_nd = time.time()
-        self.estimated_batched = self.train_records / self.global_train_batch_size
-        self.time_per_batch = 0
+# class BatchLoggerCallback(Callback):
+#     def __init__(self, batch_size, train_records, global_train_batch_size):
+#         print("Batch logger initialized")
+#         self.log_interval = batch_size
+#         self.st = time.time()
+#         self.batch_count = 0
+#         self.train_records = train_records
+#         self.global_train_batch_size = global_train_batch_size
+#         self.total = 0
+#         self.epoch = 0
+#         self.epoch_st = time.time()
+#         self.epoch_nd = time.time()
+#         self.estimated_batched = self.train_records / self.global_train_batch_size
+#         self.time_per_batch = 0
 
-    def run_event(self, event: Event, state: State, logger: Logger) -> None:
-        if event == Event.BATCH_START:
-            if self.batch_count == 0:
-                self.st = time.time()
-            self.batch_count += 1
-            self.total += 1
+#     def run_event(self, event: Event, state: State, logger: Logger) -> None:
+#         if event == Event.BATCH_START:
+#             if self.batch_count == 0:
+#                 self.st = time.time()
+#             self.batch_count += 1
+#             self.total += 1
 
-        if event == Event.EPOCH_START:
-            self.epoch_st = time.time()
+#         if event == Event.EPOCH_START:
+#             self.epoch_st = time.time()
 
-        if event == Event.EPOCH_END:
-            self.epoch_nd = time.time()
-            print(
-                f"{(self.epoch_nd - self.epoch_st):0.2f}s epoch {self.epoch} -  loss {state.loss}"
-            )
-            self.epoch += 1
-            self.epoch_st = time.time()
+#         if event == Event.EPOCH_END:
+#             self.epoch_nd = time.time()
+#             print(
+#                 f"{(self.epoch_nd - self.epoch_st):0.2f}s epoch {self.epoch} -  loss {state.loss}"
+#             )
+#             self.epoch += 1
+#             self.epoch_st = time.time()
 
-        if event == Event.BATCH_END:
-            if self.batch_count >= self.log_interval:
-                self.nd = time.time()
-                print(
-                    f"{(self.nd - self.st):0.2f}s / {self.log_interval} batches Done - {self.total} epoch {self.epoch} -  loss {state.loss}"
-                )
-                self.batch_count = 0
+#         if event == Event.BATCH_END:
+#             if self.batch_count >= self.log_interval:
+#                 self.nd = time.time()
+#                 print(
+#                     f"{(self.nd - self.st):0.2f}s / {self.log_interval} batches Done - {self.total} epoch {self.epoch} -  loss {state.loss}"
+#                 )
+#                 self.batch_count = 0
+
+
+def freeze_layers_except_last_n(model, n_layers):
+    # First freeze everything
+    for param in model.parameters():
+        param.requires_grad = False
+
+    # For BERT-like models
+    if hasattr(model, "bert"):
+        # Unfreeze the last n transformer layers
+        for layer in model.bert.encoder.layer[-n_layers:]:
+            for param in layer.parameters():
+                param.requires_grad = True
+
+    # For RoBERTa-like models
+    elif hasattr(model, "roberta"):
+        # Unfreeze the last n transformer layers
+        for layer in model.roberta.encoder.layer[-n_layers:]:
+            for param in layer.parameters():
+                param.requires_grad = True
+
+    elif hasattr(model, "distilbert"):  # distilbert
+        # Unfreeze the last n transformer layers
+        for layer in model.distilbert.transformer.layer[-n_layers:]:
+            for param in layer.parameters():
+                param.requires_grad = True
+
+    elif hasattr(model, "model"):  # modernbert
+        # Unfreeze the last n transformer layers
+        for layer in model.model.layers[-n_layers:]:
+            for param in layer.parameters():
+                param.requires_grad = True
+
+    # Always unfreeze the classification head
+    if hasattr(model, "classifier"):
+        for param in model.classifier.parameters():
+            param.requires_grad = True
+
+
+# Print trainable parameters to verify
+def count_trainable_parameters(model):
+    trainable_params = 0
+    all_param = 0
+    for param in model.parameters():
+        all_param += param.numel()
+        if param.requires_grad:
+            trainable_params += param.numel()
+    print(
+        f"trainable params: {trainable_params:,d} || all params: {all_param:,d} "
+        f"|| trainable%: {100 * trainable_params / all_param:.2f}"
+    )
 
 
 if __name__ == "__main__":
@@ -264,6 +318,7 @@ if __name__ == "__main__":
     SAVE_TENSORRT = str(train_config.get("save_tensorrt", "true")).strip().lower() in [
         "true"
     ]
+    last_n_layers_to_train = int(train_config.get("last_n_layers_to_train", 0))
     for d in [
         local_data_dir,
         local_model_dir,
@@ -315,6 +370,9 @@ if __name__ == "__main__":
 
     hf_model = transformers.AutoModelForSequenceClassification.from_config(config)
 
+    freeze_layers_except_last_n(hf_model, last_n_layers_to_train)
+    count_trainable_parameters(hf_model)
+
     print("Loading tokenizer from ", model_name_or_location)
     tokenizer = transformers.AutoTokenizer.from_pretrained(model_name_or_location)
 
@@ -358,8 +416,11 @@ if __name__ == "__main__":
         dataset=train_dataset,
         batch_size=device_train_batch_size,
         sampler=dist.get_sampler(train_dataset, drop_last=False, shuffle=True),
-        drop_last=False,
+        drop_last=True,
         collate_fn=data_collator,
+        num_workers=4 * 8,  #  4 * num_GPUs
+        prefetch_factor=2,
+        pin_memory=True,
     )
     validation_dataset = tokenized_datasets["validation"]
     eval_dataloader = DataLoader(
@@ -368,6 +429,8 @@ if __name__ == "__main__":
         sampler=dist.get_sampler(validation_dataset, drop_last=False, shuffle=False),
         drop_last=False,
         collate_fn=data_collator,
+        num_workers=4 * 8,
+        pin_memory=True,
     )
     # No DistributedSampler for the test_dataloader
     # because it is used in a trainer.predict loop that only tracks results from rank0
@@ -456,7 +519,7 @@ if __name__ == "__main__":
         lr=adam_lr,
         betas=(adam_beta_st, adam_beta_nd),
         eps=adam_eps,
-        weight_decay=adam_weight_decay,
+        # weight_decay=adam_weight_decay,
     )
 
     print(train_config["optimizer"]["adam"])
@@ -469,8 +532,6 @@ if __name__ == "__main__":
     linear_lr_decay = composer.optim.scheduler.LinearScheduler(
         alpha_i=ls_alpha_i, alpha_f=ls_alpha_f, t_max=t_max
     )
-
-    algorithms = []
 
     print(f"Composer version: {composer.__version__}")
 
@@ -494,22 +555,41 @@ if __name__ == "__main__":
         tokenized_datasets.get("train").shape[0] if "train" in tokenized_datasets else 0
     )
 
+    gc = GradientClipping(clipping_type="norm", clipping_threshold=0.1)
+    algorithms = [
+        gc,
+        # composer.algorithms.GatedLinearUnits(),  # Improves transformer performance
+        # composer.algorithms.Alibi(max_sequence_length=max_len),  # Better attention
+        # composer.algorithms.FusedLayerNorm(),  # Faster layer normalization
+        # composer.algorithms.LowPrecisionLayerNorm(),  # Memory efficient
+        # SelectiveBackprop(),
+    ]
+
+    early_stopper = EarlyStopper(
+        monitor="CrossEntropy",
+        dataloader_label="eval",
+        comp="less",
+        patience=3,
+        min_delta=0.001,
+    )
+
     # Create Trainer Object
     trainer = Trainer(
         model=composer_model,
         run_name=os.environ.get("RUN_NAME"),
-        # console_log_level="batch",
+        console_log_interval="1ep",
         train_dataloader=train_dataloader,
-        # eval_dataloader=eval_dataloader,
+        eval_dataloader=eval_dataloader,
         max_duration=train_config.get("max_duration", "1ep"),
         optimizers=optimizer,
         schedulers=[linear_lr_decay],
-        # grad_accum=train_config.get("grad_accum","auto"),
+        # device_train_microbatch_size=train_config.get("grad_accum", "auto"),
         loggers=loggers,
         algorithms=algorithms,
         device="gpu" if torch.cuda.is_available() else "cpu",
         train_subset_num_batches=int(train_config.get("train_subset_num_batches", -1)),
-        # eval_subset_num_batches=int(train_config.get("eval_subset_num_batches", -1)),
+        eval_subset_num_batches=int(train_config.get("eval_subset_num_batches", -1)),
+        eval_interval="1ep",
         precision=train_config.get("precision", "fp32"),
         seed=17,
         save_folder=checkpoint_dir,
@@ -518,14 +598,17 @@ if __name__ == "__main__":
         save_latest_filename="latest",
         save_interval=train_config.get("save_interval", "1ep"),
         callbacks=[
-            BatchLoggerCallback(
-                batch_size=train_config.get("log_every_x_batches", 1000),
-                train_records=train_records,
-                global_train_batch_size=global_train_batch_size,
-            )
+            early_stopper,
+            SpeedMonitor(window_size=100),
+            LRMonitor(),
+            # BatchLoggerCallback(
+            #     batch_size=train_config.get("log_every_x_batches", 1000),
+            #     train_records=train_records,
+            #     global_train_batch_size=global_train_batch_size,
+            # ),
         ],
         progress_bar=train_config.get("progress_bar", True),
-        log_to_console=train_config.get("log_to_console", None),
+        log_to_console=train_config.get("log_to_console", True),
     )
 
     trn_st = time.time()
