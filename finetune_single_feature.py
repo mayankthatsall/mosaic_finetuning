@@ -403,6 +403,10 @@ if __name__ == "__main__":
     tax_codes = tax_df['Tax_Code'].tolist()
     tax_descs = tax_df['Combined_Text'].tolist()
 
+    # Initialize tokenizer and model
+    tokenizer = transformers.DistilBertTokenizer.from_pretrained("distilbert-base-uncased")
+    max_len = train_config.get("maxlen", 256)
+
     # Initialize sentence transformer
     sbert = SentenceTransformer('all-MiniLM-L6-v2')
     # Pre-compute tax code embeddings
