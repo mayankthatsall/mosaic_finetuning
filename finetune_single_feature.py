@@ -71,6 +71,26 @@ class DistilBertWithSimilarity(torch.nn.Module):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+        
+    def save_pretrained(self, save_directory):
+        """Save the model and its configuration."""
+        os.makedirs(save_directory, exist_ok=True)
+        
+        # Save model weights
+        torch.save(self.state_dict(), os.path.join(save_directory, "pytorch_model.bin"))
+        
+        # Save config
+        self.config.save_pretrained(save_directory)
+        
+        # Save model architecture info
+        model_info = {
+            "model_type": "distilbert",
+            "num_labels": self.classifier.out_features,
+            "num_taxcodes": self.similarity_layer.in_features,
+            "hidden_size": self.pre_classifier.in_features
+        }
+        with open(os.path.join(save_directory, "model_info.json"), "w") as f:
+            json.dump(model_info, f, indent=2)
 
 
 TRAINING_COLUMNS = ["input_ids", "attention_mask", "labels", "similarity_scores"]
@@ -121,7 +141,7 @@ def tokenize_dataset(tokenizer, max_length, label_encoder, sbert, tax_embeds, sa
     )
     labels = sample[label_column]
     tgt = label_encoder.transform(labels)
-    
+        
     # Compute similarity scores on CPU
     text_embeds = sbert.encode(sample[feature_column], convert_to_tensor=False)
     similarity_scores = util.pytorch_cos_sim(
