@@ -721,7 +721,7 @@ if __name__ == "__main__":
             # batch = trainer.device.batch_to_device(batch)
             y_true.extend(batch["labels"].cpu().numpy())
             predicted = trainer.state.model(batch)
-            logits = predicted.logits.detach().cpu()
+            logits = predicted["logits"].detach().cpu()
             probs = torch.nn.functional.softmax(logits, dim=-1)
             probs, ix = torch.topk(probs, k=3, dim=-1)
             pred_probs = [[a.item() for a in p] for p in probs]
