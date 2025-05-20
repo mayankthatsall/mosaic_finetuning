@@ -509,7 +509,9 @@ if __name__ == "__main__":
         sampler=None,  # dist.get_sampler(validation_dataset, drop_last=False, shuffle=False),
     )
 
-    print(f"Datasets tokenized {tokenized_datasets.shape}")
+    print("Datasets tokenized:")
+    for split in tokenized_datasets:
+        print(f"  {split}: {len(tokenized_datasets[split])} samples")
     # endregion
 
     metrics = [
