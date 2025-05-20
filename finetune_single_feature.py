@@ -121,9 +121,12 @@ def tokenize_dataset(tokenizer, max_length, label_encoder, sbert, tax_embeds, sa
     labels = sample[label_column]
     tgt = label_encoder.transform(labels)
     
-    # Compute similarity scores
-    text_embeds = sbert.encode(sample[feature_column], convert_to_tensor=True)
-    similarity_scores = util.pytorch_cos_sim(text_embeds, tax_embeds).cpu().numpy()
+    # Compute similarity scores on CPU
+    text_embeds = sbert.encode(sample[feature_column], convert_to_tensor=False)
+    similarity_scores = util.pytorch_cos_sim(
+        torch.tensor(text_embeds), 
+        tax_embeds.cpu()
+    ).numpy()
     
     encodings = {
         "input_ids": src["input_ids"],
@@ -409,8 +412,8 @@ if __name__ == "__main__":
 
     # Initialize sentence transformer
     sbert = SentenceTransformer('all-MiniLM-L6-v2')
-    # Pre-compute tax code embeddings
-    tax_embeds = sbert.encode(tax_descs, convert_to_tensor=True)
+    # Pre-compute tax code embeddings on CPU
+    tax_embeds = sbert.encode(tax_descs, convert_to_tensor=True).cpu()
     num_taxcodes = len(tax_codes)
 
     # Update the model initialization
@@ -418,6 +421,10 @@ if __name__ == "__main__":
 
     # Update the tokenization call
     p_tokenized = partial(tokenize_dataset, tokenizer, max_len, label_encoder, sbert, tax_embeds)
+
+    # Set multiprocessing start method to 'spawn'
+    import torch.multiprocessing as mp
+    mp.set_start_method('spawn', force=True)
 
     vestigial_columns = set()
     for k, d in ds.items():
