@@ -76,7 +76,7 @@ def load_data(local_dir: str):
 
     return ds, label_encoder
 
-def compute_similarity_matrix(train_texts, taxcode_file, device='gpu'):
+def compute_similarity_matrix(train_texts, taxcode_file, device='cuda'):
     print("Computing similarity matrix using SBERT...")
     sbert = SentenceTransformer('all-MiniLM-L6-v2')
     sbert.to(device)
