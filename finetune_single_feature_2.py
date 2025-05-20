@@ -732,7 +732,7 @@ if __name__ == "__main__":
                 [(k, l) for k, l in zip(i, j)] for i, j in zip(pred_labels, pred_probs)
             ]
             final_res.extend(res)
-            for p in predicted.logits:
+            for p in predicted["logits"]:
                 y_pred.append(torch.argmax(p).item())
 
         target_names = list(label_encoder.classes_)
