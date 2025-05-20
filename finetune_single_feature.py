@@ -40,6 +40,7 @@ class DistilBertWithSimilarity(torch.nn.Module):
     def __init__(self, num_labels, num_taxcodes):
         super().__init__()
         self.distilbert = transformers.DistilBertModel.from_pretrained("distilbert-base-uncased")
+        self.config = self.distilbert.config  # Add config from base model
         self.pre_classifier = torch.nn.Linear(768, 768)
         self.classifier = torch.nn.Linear(768, num_labels)
         self.dropout = torch.nn.Dropout(0.1)
