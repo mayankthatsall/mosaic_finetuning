@@ -720,11 +720,7 @@ if __name__ == "__main__":
             batch = _device.batch_to_device(batch)
             # batch = trainer.device.batch_to_device(batch)
             y_true.extend(batch["labels"].cpu().numpy())
-            predicted = trainer.state.model(
-            input_ids=batch["input_ids"],
-            attention_mask=batch["attention_mask"],
-            similarity=batch.get("similarity", None),
-            labels=batch.get("labels", None),)
+            predicted = trainer.state.model(batch)
             logits = predicted.logits.detach().cpu()
             probs = torch.nn.functional.softmax(logits, dim=-1)
             probs, ix = torch.topk(probs, k=3, dim=-1)
