@@ -422,10 +422,6 @@ if __name__ == "__main__":
     # Update the tokenization call
     p_tokenized = partial(tokenize_dataset, tokenizer, max_len, label_encoder, sbert, tax_embeds)
 
-    # Set multiprocessing start method to 'spawn'
-    import torch.multiprocessing as mp
-    mp.set_start_method('spawn', force=True)
-
     vestigial_columns = set()
     for k, d in ds.items():
         for c in d.column_names:
@@ -434,10 +430,11 @@ if __name__ == "__main__":
 
     print(f"Removing {vestigial_columns}")
 
+    # Disable multiprocessing for tokenization
     tokenized_datasets = ds.map(
         function=p_tokenized,
         batched=True,
-        num_proc=cpu_count(),
+        num_proc=1,  # Use single process
         remove_columns=list(vestigial_columns),
     )
     for k, d in tokenized_datasets.items():
