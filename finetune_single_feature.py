@@ -440,6 +440,12 @@ if __name__ == "__main__":
     for k, d in tokenized_datasets.items():
         d.set_format(type="torch", columns=TRAINING_COLUMNS)
 
+    # Set batch sizes
+    global_train_batch_size = int(train_config.get("train_batch_size", 128))
+    global_eval_batch_size = int(train_config.get("eval_batch_size", 5000))
+    device_train_batch_size = global_train_batch_size // dist.get_world_size()
+    device_eval_batch_size = global_eval_batch_size // dist.get_world_size()
+
     data_collator = transformers.data.data_collator.default_data_collator
     train_dataset = tokenized_datasets["train"]
     train_dataloader = DataLoader(
