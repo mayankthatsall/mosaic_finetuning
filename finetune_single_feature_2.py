@@ -397,6 +397,21 @@ if __name__ == "__main__":
     np.save(labels_path, label_encoder.classes_)
     # endregion
 
+    # region prepare_datasets
+    all_texts = []
+    split_indices = {}
+
+    for split in ["train", "validation", "test"]:
+        if split in ds:
+            split_indices[split] = (len(all_texts), len(all_texts) + len(ds[split]))
+            all_texts.extend(ds[split][feature_column])
+
+    similarity_matrix, num_taxcodes = compute_similarity_matrix(
+        train_texts=all_texts,
+        taxcode_file=train_config["taxcode_file"]
+    )
+
+
     # Build a blank model from the config
     model_name_or_location = (
         local_model_dir
@@ -432,21 +447,6 @@ if __name__ == "__main__":
 
     device_train_batch_size = global_train_batch_size // dist.get_world_size()
     device_eval_batch_size = global_eval_batch_size // dist.get_world_size()
-
-    # region prepare_datasets
-    all_texts = []
-    split_indices = {}
-
-    for split in ["train", "validation", "test"]:
-        if split in ds:
-            split_indices[split] = (len(all_texts), len(all_texts) + len(ds[split]))
-            all_texts.extend(ds[split][feature_column])
-
-    similarity_matrix, num_taxcodes = compute_similarity_matrix(
-        train_texts=all_texts,
-        taxcode_file=train_config["taxcode_file"]
-    )
-
 
 
     vestigial_columns = set()
