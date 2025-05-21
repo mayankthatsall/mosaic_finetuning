@@ -76,7 +76,7 @@ def load_data(local_dir: str):
 
     return ds, label_encoder
 
-def compute_similarity_matrix(train_texts, taxcode_file, device='cuda'):
+def compute_similarity_matrix(train_texts, taxcode_file, device='cuda', batch_size=64):
     print("Computing similarity matrix using SBERT...")
     sbert = SentenceTransformer('all-MiniLM-L6-v2')
     sbert.to(device)
@@ -86,9 +86,17 @@ def compute_similarity_matrix(train_texts, taxcode_file, device='cuda'):
     tax_descs = tax_df['Combined_Text'].tolist()
     tax_codes = tax_df['Tax_Code'].tolist()
 
-    # Embed tax codes and training inputs
+    # Encode taxcode descriptions once
     tax_embeds = sbert.encode(tax_descs, convert_to_tensor=True, device=device)
-    text_embeds = sbert.encode(train_texts, convert_to_tensor=True, device=device)
+
+    # Encode texts in batches
+    text_embeds = sbert.encode(
+        train_texts,
+        convert_to_tensor=True,
+        device=device,
+        batch_size=batch_size,
+        show_progress_bar=True,
+    )
 
     sim_matrix = util.pytorch_cos_sim(text_embeds, tax_embeds).cpu().numpy()
     print("Similarity matrix shape:", sim_matrix.shape)
