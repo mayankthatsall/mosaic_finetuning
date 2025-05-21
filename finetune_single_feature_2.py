@@ -7,6 +7,7 @@ from multiprocessing import cpu_count
 import os
 import shutil
 import time
+from tqdm import tqdm
 
 # Third-party imports
 import boto3
@@ -76,8 +77,8 @@ def load_data(local_dir: str):
 
     return ds, label_encoder
 
-def compute_similarity_matrix(train_texts, taxcode_file, device='cuda', batch_size=64):
-    print("Computing similarity matrix using SBERT...")
+def compute_similarity_matrix(train_texts, taxcode_file, device='cuda', batch_size=64, sim_batch_size=5000):
+    print("Computing similarity matrix using SBERT on GPU (batched)...")
     sbert = SentenceTransformer('all-MiniLM-L6-v2')
     sbert.to(device)
 
@@ -86,10 +87,16 @@ def compute_similarity_matrix(train_texts, taxcode_file, device='cuda', batch_si
     tax_descs = tax_df['Combined_Text'].tolist()
     tax_codes = tax_df['Tax_Code'].tolist()
 
-    # Encode taxcode descriptions once
-    tax_embeds = sbert.encode(tax_descs, convert_to_tensor=True, device=device)
+    # Encode tax codes (small) — single pass on GPU
+    tax_embeds = sbert.encode(
+        tax_descs,
+        convert_to_tensor=True,
+        device=device,
+        batch_size=batch_size,
+        show_progress_bar=True,
+    )
 
-    # Encode texts in batches
+    # Encode texts (large) — also on GPU
     text_embeds = sbert.encode(
         train_texts,
         convert_to_tensor=True,
@@ -98,7 +105,20 @@ def compute_similarity_matrix(train_texts, taxcode_file, device='cuda', batch_si
         show_progress_bar=True,
     )
 
-    sim_matrix = util.pytorch_cos_sim(text_embeds, tax_embeds).cpu().numpy()
+    # Compute cosine similarity in chunks
+    def batched_cos_sim(a, b, sim_batch_size):
+        results = []
+        for i in tqdm(range(0, a.size(0), sim_batch_size), desc="Cosine similarity batches"):
+            chunk = a[i:i+sim_batch_size]
+            chunk = torch.nn.functional.normalize(chunk, p=2, dim=1)
+            b_norm = torch.nn.functional.normalize(b, p=2, dim=1)
+            sim_chunk = torch.mm(chunk, b_norm.transpose(0, 1))
+            results.append(sim_chunk)
+        return torch.cat(results, dim=0)
+
+    sim_matrix = batched_cos_sim(text_embeds, tax_embeds, sim_batch_size=sim_batch_size)
+    sim_matrix = sim_matrix.cpu().numpy()  # move to CPU for downstream use
+
     print("Similarity matrix shape:", sim_matrix.shape)
     return sim_matrix, len(tax_codes)
 
