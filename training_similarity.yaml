@@ -1,0 +1,86 @@
+name: mayank-clothing
+
+compute:
+  cluster: r7z23p1
+  gpu_type: a100_40gb
+  gpus: 8
+
+image: mosaicml/composer:0.28.0
+
+integrations:
+  - integration_type: pip_packages
+    packages:
+      - flash-attn==1.0.4
+      - transformers==4.48.1
+      - scikit-learn
+      - numpy==1.23
+      - mosaicml==0.28.0
+      - composer==0.28.0
+      - onnx
+      - onnxruntime-gpu
+      - onnxruntime
+      - dask
+      - datasets
+      - tensorrt
+      - huggingface-hub==0.24.0
+      - sentence-transformers==2.2.2
+      - s3fs
+    upgrade: true
+  - integration_type: git_repo
+    git_repo: mayankthatsall/mosaic_finetuning
+    git_branch: master
+    path: /workspace # The folder to clone the code into
+
+command: PYTHONUNBUFFERED=1 composer /workspace/finetune_single_feature_2.py -f /mnt/config/parameters.yaml --master_port 4040
+parameters:
+  job_name: mayank_exp
+  workdir: /workspace/data
+
+  load_as_weights: false
+  maxlen: 256
+  model: distilbert-base-uncased
+  model_script: clothing
+
+  dataset: s3://avalara-mosaicml-datasets/taxcode_datasets/ims_b2c/clothing/
+  s3_out_dest: s3://avalara-mosaicml-datasets/taxcode_models/similarity_b2c/clothing/
+  # bulk_s3_out_dest: s3://avalara-mosaicml-datasets/taxcode_models/testing_sim_exp/IT/bulk/
+  # single_s3_out_dest: s3://avalara-mosaicml-datasets/taxcode_models/testing_sim_exp/IT/single/
+  taxcode_file: s3://avalara-mosaicml-datasets/taxcode_datasets/ps_clean_2024/avalara_tax_codes_combined.csv
+
+  max_duration: 5ep
+  train_subset_num_batches: -1
+  precision: amp_fp16
+
+  save_interval: 1ep
+  log_to_console: true
+  progress_bar: false
+  console_log_level: epoch
+  log_every_x_batches: 5000
+
+  train_batch_size: 128
+  eval_batch_size: 5000
+  grad_accum: 1
+  last_n_layers_to_train: 0
+
+  save_tensorrt: false
+  save_composer_checkpoint: true
+  copy_lm: false
+
+  comments: distilbert seq 256 5ep with similarity scores
+
+  optimizer:
+    adam:
+      lr: 5e-5
+      betas:
+        - 0.9
+        - 0.999
+      eps: 1e-8
+      weight_decay: 0
+
+  scheduler:
+    linear_scheduler:
+      alpha_i: 1.0
+      alpha_f: 0.0
+      t_max: 1dur
+
+  algorithms: []
