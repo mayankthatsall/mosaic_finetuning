@@ -128,23 +128,6 @@ def compute_similarity_matrix(train_texts, taxcode_file, device='cuda', batch_si
     print("FAISS similarity search complete.")
     return (sims, indices, tax_codes), len(tax_codes)
 
-    # Compute cosine similarity in chunks
-    def batched_cos_sim(a, b, sim_batch_size):
-        results = []
-        b_norm = torch.nn.functional.normalize(b, p=2, dim=1).cpu()  # move once
-    
-        for i in tqdm(range(0, a.size(0), sim_batch_size), desc="Cosine similarity batches"):
-            chunk = a[i:i+sim_batch_size]
-            chunk = torch.nn.functional.normalize(chunk, p=2, dim=1)
-            sim_chunk = torch.mm(chunk.cpu(), b_norm.T)  # compute on CPU
-            results.append(sim_chunk)
-        return torch.cat(results, dim=0)
-
-    sim_matrix = batched_cos_sim(text_embeds, tax_embeds, sim_batch_size=sim_batch_size)
-    sim_matrix = sim_matrix.cpu().numpy()  # move to CPU for downstream use
-
-    print("Similarity matrix shape:", sim_matrix.shape)
-    return sim_matrix, len(tax_codes)
 
 
 def tokenize_dataset_with_split(examples, split_name, tokenizer, max_length, label_encoder, faiss_output, offset):
@@ -459,20 +442,14 @@ if __name__ == "__main__":
     rank = dist.get_global_rank()
     world_size = dist.get_world_size()
 
-    all_texts = []
-    split_indices = {}
+    if "train" not in ds:
+        raise ValueError("Expected 'train' split to exist for similarity computation.")
 
-    # Step 1: Collect all text inputs
-    for split in ["train", "validation", "test"]:
-        if split in ds:
-            split_indices[split] = (len(all_texts), len(all_texts) + len(ds[split]))
-            all_texts.extend(ds[split][feature_column])
-
-    # Step 2: Shard texts by rank
-    chunk_size = len(all_texts) // world_size
+    train_texts = ds["train"][feature_column]
+    chunk_size = len(train_texts) // world_size
     start = rank * chunk_size
-    end = len(all_texts) if rank == world_size - 1 else (rank + 1) * chunk_size
-    my_texts = all_texts[start:end]
+    end = len(train_texts) if rank == world_size - 1 else (rank + 1) * chunk_size
+    my_texts = train_texts[start:end]
 
     sim_path = os.path.join(w, "sim_matrix.npy")
     tax_path = os.path.join(w, "num_taxcodes.txt")
@@ -530,9 +507,18 @@ if __name__ == "__main__":
     print(f"Removing {vestigial_columns}")
 
     tokenized_datasets = {}
+    rank = dist.get_global_rank()
+    world_size = dist.get_world_size()
+
     for split in ["train", "validation", "test"]:
         if split in ds:
-            offset_start = split_indices[split][0]
+            # Step 1: Shard the dataset per rank
+            ds[split] = ds[split].shard(num_shards=world_size, index=rank)
+
+            # Step 2: Set offset = 0 because each rank only sees its slice
+            offset_start = 0
+
+            # Step 3: Tokenize using faiss_output for this rank only
             tokenized_datasets[split] = ds[split].map(
                 function=lambda examples: tokenize_dataset_with_split(
                     examples, split, tokenizer, max_len, label_encoder, faiss_output, offset_start
