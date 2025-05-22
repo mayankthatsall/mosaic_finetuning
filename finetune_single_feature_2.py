@@ -459,15 +459,11 @@ if __name__ == "__main__":
             split_indices[split] = (len(all_texts), len(all_texts) + len(ds[split]))
             all_texts.extend(ds[split][feature_column])
 
-    if dist.get_global_rank() == 0:
-        similarity_matrix, num_taxcodes = compute_similarity_matrix(
-            train_texts=all_texts,
-            taxcode_file=train_config["taxcode_file"],
-            sim_batch_size=500
-        )
-        np.save("/tmp/sim_matrix.npy", similarity_matrix)
-        with open("/tmp/num_taxcodes.txt", "w") as f:
-            f.write(str(num_taxcodes))
+    faiss_output, num_taxcodes = compute_similarity_matrix(
+    train_texts=all_texts,
+    taxcode_file=train_config["taxcode_file"],
+    top_k=3  # or adjust based on what you want
+    )
 
 # Ensure all ranks wait
 dist.barrier()
