@@ -437,8 +437,9 @@ if __name__ == "__main__":
             all_texts.extend(ds[split][feature_column])
 
     similarity_matrix, num_taxcodes = compute_similarity_matrix(
-        train_texts=all_texts,
-        taxcode_file=train_config["taxcode_file"]
+    train_texts=all_texts,
+    taxcode_file=train_config["taxcode_file"],
+    sim_batch_size=500  # 👈 reduce to 500–1000
     )
 
 
