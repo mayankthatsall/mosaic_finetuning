@@ -6,6 +6,7 @@ import json
 from multiprocessing import cpu_count
 import os
 import shutil
+import faiss
 from composer.utils import dist
 import time
 from tqdm import tqdm
@@ -78,8 +79,9 @@ def load_data(local_dir: str):
 
     return ds, label_encoder
 
-def compute_similarity_matrix(train_texts, taxcode_file, device='cuda', batch_size=64, sim_batch_size=5000):
-    print("Computing similarity matrix using SBERT on GPU (batched)...")
+def compute_similarity_matrix(train_texts, taxcode_file, device='cuda', batch_size=64, top_k=3):
+    print("Computing similarity matrix using FAISS on GPU...")
+
     sbert = SentenceTransformer('all-MiniLM-L6-v2')
     sbert.to(device)
 
@@ -88,23 +90,38 @@ def compute_similarity_matrix(train_texts, taxcode_file, device='cuda', batch_si
     tax_descs = tax_df['Combined_Text'].tolist()
     tax_codes = tax_df['Tax_Code'].tolist()
 
-    # Encode tax codes (small) — single pass on GPU
+    # Encode tax codes (usually small)
     tax_embeds = sbert.encode(
         tax_descs,
-        convert_to_tensor=True,
-        device=device,
+        convert_to_tensor=False,  # FAISS requires numpy
         batch_size=batch_size,
         show_progress_bar=True,
-    )
+    ).astype("float32")
 
-    # Encode texts (large) — also on GPU
+    # Encode texts (large)
     text_embeds = sbert.encode(
         train_texts,
-        convert_to_tensor=True,
-        device=device,
+        convert_to_tensor=False,
         batch_size=batch_size,
         show_progress_bar=True,
-    )
+    ).astype("float32")
+
+    # Normalize for cosine similarity (FAISS expects L2-normalized vectors for IP=cosine sim)
+    faiss.normalize_L2(text_embeds)
+    faiss.normalize_L2(tax_embeds)
+
+    # Build FAISS index on GPU
+    res = faiss.StandardGpuResources()
+    index = faiss.IndexFlatIP(tax_embeds.shape[1])  # IP = cosine sim if L2-normalized
+    gpu_index = faiss.index_cpu_to_gpu(res, 0, index)
+    gpu_index.add(tax_embeds)
+
+    # Perform search: get top-k taxcodes for each input
+    sims, indices = gpu_index.search(text_embeds, top_k)  # [num_texts x top_k]
+
+    # Build full sparse matrix if needed (optional)
+    print("FAISS similarity search complete.")
+    return (sims, indices, tax_codes), len(tax_codes)
 
     # Compute cosine similarity in chunks
     def batched_cos_sim(a, b, sim_batch_size):
