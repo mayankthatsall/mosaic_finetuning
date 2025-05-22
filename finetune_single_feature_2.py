@@ -6,6 +6,7 @@ import json
 from multiprocessing import cpu_count
 import os
 import shutil
+from composer.utils import dist
 import time
 from tqdm import tqdm
 
