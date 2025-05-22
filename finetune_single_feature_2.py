@@ -525,7 +525,7 @@ if dist.get_global_rank() != 0:
             offset_start = split_indices[split][0]
             tokenized_datasets[split] = ds[split].map(
                 function=lambda examples: tokenize_dataset_with_split(
-                    examples, split, tokenizer, max_len, label_encoder, similarity_matrix, offset_start
+                    examples, split, tokenizer, max_len, label_encoder, faiss_output, offset_start
                 ),
                 batched=True,
                 num_proc=cpu_count(),
