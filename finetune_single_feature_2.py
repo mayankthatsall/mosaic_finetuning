@@ -436,11 +436,23 @@ if __name__ == "__main__":
             split_indices[split] = (len(all_texts), len(all_texts) + len(ds[split]))
             all_texts.extend(ds[split][feature_column])
 
+    if dist.get_global_rank() == 0:
     similarity_matrix, num_taxcodes = compute_similarity_matrix(
-    train_texts=all_texts,
-    taxcode_file=train_config["taxcode_file"],
-    sim_batch_size=500  # 👈 reduce to 500–1000
+        train_texts=all_texts,
+        taxcode_file=train_config["taxcode_file"],
+        sim_batch_size=500
     )
+    np.save("/tmp/sim_matrix.npy", similarity_matrix)
+    with open("/tmp/num_taxcodes.txt", "w") as f:
+        f.write(str(num_taxcodes))
+
+# Ensure all ranks wait
+dist.barrier()
+
+if dist.get_global_rank() != 0:
+    similarity_matrix = np.load("/tmp/sim_matrix.npy")
+    with open("/tmp/num_taxcodes.txt") as f:
+        num_taxcodes = int(f.read())
 
 
     # Build a blank model from the config
