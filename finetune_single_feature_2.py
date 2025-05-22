@@ -6,7 +6,7 @@ import json
 from multiprocessing import cpu_count
 import os
 import shutil
-import faiss
+faiss = None
 from composer.utils import dist
 import time
 from tqdm import tqdm
@@ -80,6 +80,10 @@ def load_data(local_dir: str):
     return ds, label_encoder
 
 def compute_similarity_matrix(train_texts, taxcode_file, device='cuda', batch_size=64, top_k=3):
+    global faiss
+    if faiss is None:
+        import faiss
+        print(f"[RANK {dist.get_global_rank()}] FAISS imported and running")
     print("Computing similarity matrix using FAISS on GPU...")
 
     sbert = SentenceTransformer('all-MiniLM-L6-v2')
