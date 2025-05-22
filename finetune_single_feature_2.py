@@ -142,7 +142,8 @@ def compute_similarity_matrix(train_texts, taxcode_file, device='cuda', batch_si
     return sim_matrix, len(tax_codes)
 
 
-def tokenize_dataset_with_split(examples, split_name, tokenizer, max_length, label_encoder, similarity_matrix, offset):
+def tokenize_dataset_with_split(examples, split_name, tokenizer, max_length, label_encoder, faiss_output, offset):
+    sims, indices, tax_codes = faiss_output
     src = tokenizer(
         examples[feature_column],
         padding="max_length",
@@ -150,7 +151,12 @@ def tokenize_dataset_with_split(examples, split_name, tokenizer, max_length, lab
         truncation=True,
     )
     tgt = label_encoder.transform(examples[label_column])
-    sim_vectors = [similarity_matrix[offset + i] for i in range(len(examples[feature_column]))]
+
+    sim_vectors = []
+    for i in range(len(examples[feature_column])):
+        one_hot = np.zeros(len(tax_codes), dtype=np.float32)
+        one_hot[indices[offset + i]] = sims[offset + i]
+        sim_vectors.append(one_hot)
 
     return {
         "input_ids": src["input_ids"],
