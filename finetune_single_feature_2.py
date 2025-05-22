@@ -6,6 +6,7 @@ import json
 from multiprocessing import cpu_count
 import os
 import shutil
+import time  # ensure this is at the top if not already
 faiss = None
 from composer.utils import dist
 import time
@@ -465,7 +466,7 @@ if __name__ == "__main__":
 
     sim_path = os.path.join(w, "sim_matrix.npy")
     tax_path = os.path.join(w, "num_taxcodes.txt")
-    
+
     if dist.get_global_rank() == 0:
         faiss_output, num_taxcodes = compute_similarity_matrix(
             train_texts=all_texts,
@@ -475,11 +476,22 @@ if __name__ == "__main__":
         np.save(sim_path, faiss_output)
         with open(tax_path, "w") as f:
             f.write(str(num_taxcodes))
-    
-    # Ensure all ranks wait for rank 0 to finish
+
+    # Sync all ranks
     dist.barrier()
-    
+    time.sleep(3)  # Let file I/O settle
+
+    # Load FAISS results on non-rank-0
     if dist.get_global_rank() != 0:
+        attempts = 5
+        for i in range(attempts):
+            if os.path.exists(sim_path) and os.path.exists(tax_path):
+                break
+            print(f"[RANK {dist.get_global_rank()}] Waiting for FAISS files... ({i+1}/{attempts})")
+            time.sleep(2)
+        else:
+            raise RuntimeError(f"[RANK {dist.get_global_rank()}] sim_matrix.npy or tax_path not found after {attempts} tries.")
+
         faiss_output = np.load(sim_path, allow_pickle=True)
         with open(tax_path) as f:
             num_taxcodes = int(f.read())
