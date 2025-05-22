@@ -437,14 +437,14 @@ if __name__ == "__main__":
             all_texts.extend(ds[split][feature_column])
 
     if dist.get_global_rank() == 0:
-    similarity_matrix, num_taxcodes = compute_similarity_matrix(
-        train_texts=all_texts,
-        taxcode_file=train_config["taxcode_file"],
-        sim_batch_size=500
-    )
-    np.save("/tmp/sim_matrix.npy", similarity_matrix)
-    with open("/tmp/num_taxcodes.txt", "w") as f:
-        f.write(str(num_taxcodes))
+        similarity_matrix, num_taxcodes = compute_similarity_matrix(
+            train_texts=all_texts,
+            taxcode_file=train_config["taxcode_file"],
+            sim_batch_size=500
+        )
+        np.save("/tmp/sim_matrix.npy", similarity_matrix)
+        with open("/tmp/num_taxcodes.txt", "w") as f:
+            f.write(str(num_taxcodes))
 
 # Ensure all ranks wait
 dist.barrier()
