@@ -108,11 +108,12 @@ def compute_similarity_matrix(train_texts, taxcode_file, device='cuda', batch_si
     # Compute cosine similarity in chunks
     def batched_cos_sim(a, b, sim_batch_size):
         results = []
+        b_norm = torch.nn.functional.normalize(b, p=2, dim=1).cpu()  # move once
+    
         for i in tqdm(range(0, a.size(0), sim_batch_size), desc="Cosine similarity batches"):
             chunk = a[i:i+sim_batch_size]
             chunk = torch.nn.functional.normalize(chunk, p=2, dim=1)
-            b_norm = torch.nn.functional.normalize(b, p=2, dim=1)
-            sim_chunk = torch.mm(chunk, b_norm.transpose(0, 1))
+            sim_chunk = torch.mm(chunk.cpu(), b_norm.T)  # compute on CPU
             results.append(sim_chunk)
         return torch.cat(results, dim=0)
 
