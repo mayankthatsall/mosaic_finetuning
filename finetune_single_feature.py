@@ -502,12 +502,12 @@ if __name__ == "__main__":
 
             # Step 3: Tokenize using faiss_output for this rank only
             tokenized_datasets[split] = ds[split].map(
-                function=lambda examples: tokenize_dataset_with_split(
-                    examples, split, tokenizer, max_len, label_encoder, faiss_output, offset_start
-                ),
-                batched=True,
-                num_proc=cpu_count(),
-                remove_columns=list(vestigial_columns),
+            function=lambda examples, faiss_output=similarity_matrix: tokenize_dataset_with_split(
+                examples, split, tokenizer, max_len, label_encoder, faiss_output, offset_start
+            ),
+            batched=True,
+            num_proc=cpu_count(),
+            remove_columns=list(vestigial_columns),
             )
 
 
