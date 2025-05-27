@@ -437,10 +437,9 @@ if __name__ == "__main__":
     sim_path = os.path.join(w, "sim_matrix.npy")
     tax_path = os.path.join(w, "num_taxcodes.txt")
 
-    faiss_output, num_taxcodes = compute_similarity_matrix(
+    similarity_matrix, num_taxcodes = compute_similarity_matrix(
     train_texts=my_texts,
-    taxcode_file=train_config["taxcode_file"],
-    top_k=3
+    taxcode_file=train_config["taxcode_file"]
     )
 
 
