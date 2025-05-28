@@ -506,7 +506,7 @@ if __name__ == "__main__":
                 examples, split, tokenizer, max_len, label_encoder, faiss_output, offset_start
             ),
             batched=True,
-            num_proc=cpu_count(),
+            num_proc=1,
             remove_columns=list(vestigial_columns),
             )
 
