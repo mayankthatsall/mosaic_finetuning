@@ -6,11 +6,7 @@ import json
 from multiprocessing import cpu_count
 import os
 import shutil
-import time  # ensure this is at the top if not already
-faiss = None
-from composer.utils import dist
 import time
-from tqdm import tqdm
 
 # Third-party imports
 import boto3
@@ -31,18 +27,16 @@ from sklearn.metrics import classification_report
 from sklearn.preprocessing import LabelEncoder
 import tabulate
 import torch
-from torch import nn
-from sentence_transformers import SentenceTransformer, util
-from transformers import DistilBertModel, DistilBertPreTrainedModel
 from torch.utils.data import DataLoader
 from torchmetrics import Accuracy, F1Score
 import transformers
+from safetensors.torch import load_file
 
 # Local imports
 from pysrc.inference_export import export_for_inference, get_trainer_config
 
 
-TRAINING_COLUMNS = ["input_ids", "attention_mask", "labels", "similarity"]
+TRAINING_COLUMNS = ["input_ids", "attention_mask", "labels"]
 label_column = "taxcode"
 
 
@@ -80,61 +74,22 @@ def load_data(local_dir: str):
 
     return ds, label_encoder
 
-def compute_similarity_matrix(train_texts, taxcode_file, device='cuda', batch_size=64):
-    global faiss
-    if faiss is None:
-        import faiss
-        print(f"[RANK {dist.get_global_rank()}] FAISS imported and running")
-    print("Computing full similarity matrix using FAISS on GPU...")
 
-    sbert = SentenceTransformer('all-MiniLM-L6-v2')
-    sbert.to(device)
-
-    # Load tax code descriptions
-    tax_df = pd.read_csv(taxcode_file)
-    tax_descs = tax_df['Combined_Text'].tolist()
-    tax_codes = tax_df['Tax_Code'].tolist()
-
-    # Encode tax codes
-    tax_embeds = sbert.encode(
-        tax_descs, convert_to_tensor=False, batch_size=batch_size, show_progress_bar=True
-    ).astype("float32")
-
-    # Encode input texts
-    text_embeds = sbert.encode(
-        train_texts, convert_to_tensor=False, batch_size=batch_size, show_progress_bar=True
-    ).astype("float32")
-
-    # Normalize for cosine similarity
-    faiss.normalize_L2(text_embeds)
-    faiss.normalize_L2(tax_embeds)
-
-    # Compute full cosine similarity matrix: [N x C]
-    sims = np.matmul(text_embeds, tax_embeds.T)
-
-    print("✅ Full similarity matrix computed.")
-    return sims, len(tax_codes)
-
-
-
-def tokenize_dataset_with_split(examples, split_name, tokenizer, max_length, label_encoder, similarity_matrix, offset):
+def tokenize_dataset(tokenizer, max_length, label_encoder, sample):
     src = tokenizer(
-        examples[feature_column],
+        sample[feature_column],
         padding="max_length",
         max_length=max_length,
         truncation=True,
     )
-    tgt = label_encoder.transform(examples[label_column])
-
-    # Directly slice the corresponding similarity rows
-    sim_vectors = similarity_matrix[offset : offset + len(examples[feature_column])]
-
-    return {
+    labels = sample[label_column]
+    tgt = label_encoder.transform(labels)
+    encodings = {
         "input_ids": src["input_ids"],
         "attention_mask": src["attention_mask"],
         "labels": tgt,
-        "similarity": sim_vectors
     }
+    return encodings
 
 
 def s3_sync(s3_path: str, local_dir: str, pull=True) -> None:
@@ -323,27 +278,6 @@ def freeze_layers_except_last_n(model, n_layers):
         for param in model.classifier.parameters():
             param.requires_grad = True
 
-class DistilBertWithSimilarity(DistilBertPreTrainedModel):
-    def __init__(self, config, num_taxcodes):
-        super().__init__(config)
-        self.distilbert = DistilBertModel(config)
-        self.dropout = torch.nn.Dropout(config.seq_classif_dropout)
-        self.classifier = torch.nn.Linear(config.hidden_size + num_taxcodes, config.num_labels)
-        self.num_taxcodes = num_taxcodes
-        self.init_weights()
-
-    def forward(self, input_ids, attention_mask=None, labels=None, similarity=None, **kwargs):
-        outputs = self.distilbert(input_ids=input_ids, attention_mask=attention_mask)
-        cls_embed = outputs.last_hidden_state[:, 0]
-        x = self.dropout(cls_embed)
-        if similarity is not None:
-            x = torch.cat([x, similarity], dim=-1)
-        logits = self.classifier(x)
-        loss = None
-        if labels is not None:
-            loss_fct = torch.nn.CrossEntropyLoss()
-            loss = loss_fct(logits, labels)
-        return {"loss": loss, "logits": logits}
 
 # Print trainable parameters to verify
 def count_trainable_parameters(model):
@@ -421,28 +355,6 @@ if __name__ == "__main__":
     np.save(labels_path, label_encoder.classes_)
     # endregion
 
-    # region prepare_datasets
-    rank = dist.get_global_rank()
-    world_size = dist.get_world_size()
-
-    if "train" not in ds:
-        raise ValueError("Expected 'train' split to exist for similarity computation.")
-
-    train_texts = ds["train"][feature_column]
-    chunk_size = len(train_texts) // world_size
-    start = rank * chunk_size
-    end = len(train_texts) if rank == world_size - 1 else (rank + 1) * chunk_size
-    my_texts = train_texts[start:end]
-
-    sim_path = os.path.join(w, "sim_matrix.npy")
-    tax_path = os.path.join(w, "num_taxcodes.txt")
-
-    similarity_matrix, num_taxcodes = compute_similarity_matrix(
-    train_texts=my_texts,
-    taxcode_file=train_config["taxcode_file"]
-    )
-
-
     # Build a blank model from the config
     model_name_or_location = (
         local_model_dir
@@ -457,7 +369,7 @@ if __name__ == "__main__":
 
     print("Loading model from ", model_name_or_location)
 
-    hf_model = DistilBertWithSimilarity(config, num_taxcodes=num_taxcodes)
+    hf_model = transformers.AutoModelForSequenceClassification.from_config(config)
 
     freeze_layers_except_last_n(hf_model, last_n_layers_to_train)
     count_trainable_parameters(hf_model)
@@ -479,6 +391,8 @@ if __name__ == "__main__":
     device_train_batch_size = global_train_batch_size // dist.get_world_size()
     device_eval_batch_size = global_eval_batch_size // dist.get_world_size()
 
+    # region prepare_datasets
+    p_tokenized = partial(tokenize_dataset, tokenizer, max_len, label_encoder)
 
     vestigial_columns = set()
     for k, d in ds.items():
@@ -488,29 +402,12 @@ if __name__ == "__main__":
 
     print(f"Removing {vestigial_columns}")
 
-    tokenized_datasets = {}
-    rank = dist.get_global_rank()
-    world_size = dist.get_world_size()
-
-    for split in ["train", "validation", "test"]:
-        if split in ds:
-            # Step 1: Shard the dataset per rank
-            ds[split] = ds[split].shard(num_shards=world_size, index=rank)
-
-            # Step 2: Set offset = 0 because each rank only sees its slice
-            offset_start = 0
-
-            # Step 3: Tokenize using faiss_output for this rank only
-            tokenized_datasets[split] = ds[split].map(
-            function=lambda examples, faiss_output=similarity_matrix: tokenize_dataset_with_split(
-                examples, split, tokenizer, max_len, label_encoder, faiss_output, offset_start
-            ),
-            batched=True,
-            num_proc=1,
-            remove_columns=list(vestigial_columns),
-            )
-
-
+    tokenized_datasets = ds.map(
+        function=p_tokenized,
+        batched=True,
+        num_proc=cpu_count(),
+        remove_columns=list(vestigial_columns),
+    )
     for k, d in tokenized_datasets.items():
         d.set_format(type="torch", columns=TRAINING_COLUMNS)
 
@@ -549,9 +446,7 @@ if __name__ == "__main__":
         sampler=None,  # dist.get_sampler(validation_dataset, drop_last=False, shuffle=False),
     )
 
-    print("Datasets tokenized:")
-    for split in tokenized_datasets:
-        print(f"  {split}: {len(tokenized_datasets[split])} samples")
+    print(f"Datasets tokenized {tokenized_datasets.shape}")
     # endregion
 
     metrics = [
@@ -590,13 +485,16 @@ if __name__ == "__main__":
 
     # Load the weights
     if train_config.get("load_as_weights", False):
-        pretrained_hf_state_dict = torch.load(
-            os.path.join(local_model_dir, "pytorch_model.bin")
-        )
+        # pretrained_hf_state_dict = torch.load(
+        #     os.path.join(local_model_dir, "pytorch_model.bin")
+        # )
+        pretrained_hf_state_dict = load_file(os.path.join(local_model_dir, "model.safetensors"))
+        
         # missing_keys, unexpected_keys = composer_model.model.load_state_dict(pretrained_hf_state_dict, strict=False)
         missing_keys, unexpected_keys = composer_model.load_state_dict(
             pretrained_hf_state_dict, strict=False
         )
+        print("Loaded weights from pretrained model")
         if len(missing_keys) > 0:
             print("MISSING_KEYS")
             for k in missing_keys:
@@ -761,7 +659,7 @@ if __name__ == "__main__":
             # batch = trainer.device.batch_to_device(batch)
             y_true.extend(batch["labels"].cpu().numpy())
             predicted = trainer.state.model(batch)
-            logits = predicted["logits"].detach().cpu()
+            logits = predicted.logits.detach().cpu()
             probs = torch.nn.functional.softmax(logits, dim=-1)
             probs, ix = torch.topk(probs, k=3, dim=-1)
             pred_probs = [[a.item() for a in p] for p in probs]
@@ -772,7 +670,7 @@ if __name__ == "__main__":
                 [(k, l) for k, l in zip(i, j)] for i, j in zip(pred_labels, pred_probs)
             ]
             final_res.extend(res)
-            for p in predicted["logits"]:
+            for p in predicted.logits:
                 y_pred.append(torch.argmax(p).item())
 
         target_names = list(label_encoder.classes_)
